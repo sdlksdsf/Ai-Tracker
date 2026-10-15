@@ -1,0 +1,32 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": [
+      "node"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@platematch/shared": [
+        "../shared/src/index.ts"
+      ],
+      "@platematch/shared/*": [
+        "../shared/src/*"
+      ],
+      "@/*": [
+        "src/*"
+      ]
+    },
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "drizzle.config.ts",
+    "tsup.config.ts",
+    "vitest.config.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}
