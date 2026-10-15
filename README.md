@@ -11,7 +11,7 @@ A production-ready, cross-platform meal planner built to attack household food w
 [![CI](https://github.com/sdlksdsf/Ai-Tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/sdlksdsf/Ai-Tracker/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-3C873A?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-641-2D8F4E)](#testing)
+[![Tests](https://img.shields.io/badge/tests-647-2D8F4E)](#testing)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](#type-safety)
 
 **Runs with zero API keys.** Add a key for any one capability and only that capability goes live.
@@ -417,19 +417,19 @@ rather than silently succeeding.
 
 ## Testing
 
-**641 tests**, and all three packages — `shared`, `api` and `mobile` — typecheck with **zero errors** under `strict` + `noUncheckedIndexedAccess`.
+**647 tests**, and all three packages — `shared`, `api` and `mobile` — typecheck with **zero errors** under `strict` + `noUncheckedIndexedAccess`.
 
 ```bash
 npm test                                    # everything, via turbo
 npm run typecheck                           # shared + api + mobile
 
 cd packages/shared && npx vitest run        #  69 contract tests
-cd packages/api    && npx vitest run        # 338 unit tests
+cd packages/api    && npx vitest run        # 344 unit tests
 cd packages/api    && npm run test:e2e      # 147 integration tests (needs Postgres)
 cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobile tests
 ```
 
-494 run anywhere. The **147 integration tests** boot the real Fastify app and drive it with `app.inject()`, so they need PostgreSQL — `npm run db:up` locally, or let CI's service containers provide it. When no database is reachable they **skip loudly** rather than passing vacuously, because a green run that exercised nothing would be believed.
+500 run anywhere. The **147 integration tests** boot the real Fastify app and drive it with `app.inject()`, so they need PostgreSQL — `npm run db:up` locally, or let CI's service containers provide it. When no database is reachable they **skip loudly** rather than passing vacuously, because a green run that exercised nothing would be believed.
 
 
 | Suite | Cases | Covers |
@@ -440,6 +440,7 @@ cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobi
 | `dates` | 66 | Date maths, expiry urgency buckets, timezone resolution (including half-hour offsets), label parsing, period ranges |
 | `nutrition` | 40 | Mifflin–St Jeor targets, goal ordering, macro splits, clinical clamping, macro verification |
 | `pagination` | 40 | Page clamping, offsets, cursors, ETags, field selection |
+| `openapi` | 6 | **The generated spec actually describes the API:** >80 paths, every resource tag represented, the endpoints a client integrates against first, bearer auth, the `{ data, meta }` envelope, and `/docs/json` serving the same document |
 | `cost` | 24 | Model pricing resolution including dated suffixes, per-call cost, token estimation |
 | `format` + `parse` | 61 | Every user-facing number: money, weight, CO₂, dates, quantities |
 | `i18n` | 18 | Catalogue parity across en/es (411 keys each): missing keys, orphans, empty strings, placeholder mismatches, untranslated copies, locale-tag resolution |
@@ -468,6 +469,8 @@ Running the suite against a real PostgreSQL 18 server, and typechecking the **mo
 > **Allergies were silently discarded.** Onboarding and Preferences sent diet, budget, family size *and the allergy list* to `PATCH /users/me`. That route validates against `updateProfileSchema`, and Zod strips keys it does not know — so the server returned **200** while throwing all of it away. A user declaring a peanut allergy had no allergy stored, and the recipe guard had nothing to enforce. Both screens now call the endpoints that actually own those fields (`POST /users/me/onboarding`, `PUT /users/me/preferences`).
 
 > **The Recipes tab was permanently empty.** `GET /recipes` flattened its pagination onto the top level while every other list endpoint used `{ data, meta }`. The client helper unwrapped `data`, so the screen read `.items` off an array and got `undefined` — an empty list, with no error anywhere. The endpoint now uses the standard envelope, and `buildQuery`/`normalizePage` are unit-tested because they are the single point where this class of bug lives.
+
+> **`/docs` documented three endpoints.** `@fastify/swagger` assembles the spec from an `onRoute` hook, so it only sees routes registered *after* it — and the docs plugin was registered last, on the reasonable-sounding theory that the route schemas had to exist first. The document came out with its own `openapi.json` route, the upload wildcard and the service banner, and none of the ~90 real endpoints. Swagger UI still rendered and looked complete, and the integration harness boots with `skipDocs: true`, so nothing complained. The spec is now 98 paths / 110 operations across all 13 tags, with a test that builds the app the way `server.ts` does and counts them.
 
 Also caught: five list endpoints (`/meal-plans`, `/grocery-lists`, `/recipes/favorites`, `/recipes/history`, `/recipes`) each inventing their own pagination shape; `WeekOverviewDto` never exposing `grocery_list_id`, so the Plan screen's "open your shopping list" shortcut had nothing to open; `GET /meal-plans/:id/days` returning `date: null` and no day label, leaving the calendar cards with empty headers and no "today" highlight; per-achievement `points` computed server-side but never sent, so the "+N pts" badge could not render; a non-multipart upload to `/scan/fridge` returning **500** instead of 415; `waste/stats` breaking its own `YYYY-MM-DD` contract by returning full timestamps; two Ionicons glyph names that do not exist (`ice-cube-outline`, `filing-outline`), rendering blank icons on the freezer and pantry rows; `StatCard` imported from a path it does not live at, in four screens; and four DTO fields (`cooking_skill_level`, `dietary_preference`, `health_goal`, `activity_level`, `added_via`) typed as loose `string` while the database columns are real enums — which is what made the preferences bug invisible to the compiler.
 

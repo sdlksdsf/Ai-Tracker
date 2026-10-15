@@ -29,7 +29,7 @@ import docsPlugin from './plugins/swagger.js';
  *   5. rate-limit        (needs `request.user` to key by user id when present)
  *   6. multipart         (upload parsing)
  *   7. auth              (decorators used by route preHandlers)
- *   8. docs              (reads the schemas registered by the routes)
+ *   8. docs              (MUST precede the routes — see the note below)
  *   9. routes
  */
 export interface BuildAppOptions {
@@ -89,13 +89,19 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // 7. Authentication decorators
   await app.register(authPlugin);
 
-  // 9. Routes (registered before docs so the schemas exist)
-  await app.register(registerRoutes);
-
-  // 8. OpenAPI docs
+  // 8. OpenAPI docs — deliberately BEFORE the routes.
+  //
+  // @fastify/swagger builds the document from an `onRoute` hook, so it only ever
+  // sees routes registered after it exists. Registering it last produced a spec
+  // with three paths in it (its own openapi.json route, the upload wildcard and
+  // the banner) and none of the ~90 real endpoints, while /docs still rendered
+  // happily and looked complete.
   if (!options.skipDocs && env.ENABLE_SWAGGER) {
     await app.register(docsPlugin);
   }
+
+  // 9. Routes
+  await app.register(registerRoutes);
 
   // --- Local static file serving ------------------------------------------
   // Only for STORAGE_DRIVER=local; object storage and Cloudinary serve files
