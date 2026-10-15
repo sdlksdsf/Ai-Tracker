@@ -62,6 +62,21 @@ jobs:
         run: npm run lint --workspace=@platematch/api --if-present
         continue-on-error: true
 
+      # BLOCKING supply-chain gate, scoped to what actually ships.
+      #
+      # The whole-workspace `npm audit` is dominated by advisories in the Expo /
+      # React Native / Metro / Jest / Vitest toolchain — none of which is in the
+      # server bundle. Blocking on those keeps the gate permanently red (the spec
+      # pins Expo SDK 52 and React Native 0.76), and a gate that is always red is
+      # a gate people learn to ignore.
+      #
+      # This walks packages/api's *production* dependency subtree from the
+      # lockfile's own edges and fails on any high/critical advisory in it, minus
+      # an allow-list where every entry must carry a written reason. Reads only
+      # package-lock.json, so it needs no install.
+      - name: Audit the shipped API runtime tree
+        run: node scripts/audit-runtime.mjs
+
   # ---------------------------------------------------------------------------
   # Unit tests — pure logic, no database. Runs on every push.
   # ---------------------------------------------------------------------------
@@ -90,8 +105,13 @@ jobs:
           NODE_ENV: test
           AI_MODE: mock
 
+      # `working-directory`, not `--root`: vitest resolves `--config` *relative
+      # to* `--root`, so `--config packages/api/... --root packages/api` looked
+      # for packages/api/packages/api/vitest.config.ts and the job died at
+      # startup without running a single test.
       - name: Test api
-        run: npx vitest run --config packages/api/vitest.config.ts --root packages/api --coverage
+        run: npx vitest run --coverage
+        working-directory: packages/api
         env:
           NODE_ENV: test
           AI_MODE: mock
@@ -190,7 +210,8 @@ jobs:
         continue-on-error: true
 
       - name: Integration tests
-        run: npx vitest run --config packages/api/vitest.e2e.config.ts --root packages/api
+        run: npx vitest run --config vitest.e2e.config.ts
+        working-directory: packages/api
 
       - name: Seed smoke test
         # Proves a fresh database can be populated end to end, which is what a
@@ -269,9 +290,11 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # Moderate and above only — the low-severity stream on a React Native tree
-      # is noise that trains people to ignore this job.
-      - name: npm audit
+      # Whole-tree report, non-blocking: the blocking gate is
+      # `Audit the shipped API runtime tree` in the verify job, which is scoped to
+      # packages/api's production subtree. Moderate and above only — the
+      # low-severity stream on a React Native tree is noise.
+      - name: npm audit (whole tree, reported)
         run: npm audit --omit=dev --audit-level=moderate
         continue-on-error: true
 

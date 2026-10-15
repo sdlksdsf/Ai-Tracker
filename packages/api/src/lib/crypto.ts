@@ -214,6 +214,15 @@ export function averageHashFromGray(gray: Uint8Array | number[]): string {
   const mean = values.reduce((a, b) => a + b, 0) / values.length;
   let bits = '';
   for (const v of values) bits += v > mean ? '1' : '0';
+
+  // No variance means no information. Every pixel of a solid-colour frame sits
+  // at or below the mean, so it hashes to all zeros *whatever its colour*, and a
+  // fully saturated or blank one to all ones. Returning that value would make
+  // every degenerate image collide — and this hash is a scan-dedupe key, so the
+  // second upload would silently be handed the first one's results. Report "no
+  // usable hash" instead, which is the convention callers already handle.
+  if (bits === '0'.repeat(bits.length) || bits === '1'.repeat(bits.length)) return '';
+
   // Pack the bit string into hex.
   let hex = '';
   for (let i = 0; i < bits.length; i += 4) {

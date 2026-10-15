@@ -11,7 +11,7 @@ A production-ready, cross-platform meal planner built to attack household food w
 [![CI](https://github.com/sdlksdsf/Ai-Tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/sdlksdsf/Ai-Tracker/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-3C873A?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-647-2D8F4E)](#testing)
+[![Tests](https://img.shields.io/badge/tests-666-2D8F4E)](#testing)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](#type-safety)
 
 **Runs with zero API keys.** Add a key for any one capability and only that capability goes live.
@@ -393,9 +393,30 @@ eas build --platform all --profile production
 
 `.github/workflows/ci.yml` runs five jobs on every push: typecheck + lint, unit tests, integration tests against **real Postgres 16 and Redis 7 service containers** (migrations applied, schema drift checked, seed smoke-tested), a build that verifies all four entrypoints emit and that the server fails with a *diagnostic message* when the database is unreachable, and a dependency audit with a committed-secrets scan.
 
-`.github/workflows/security.yml` boots the real API against Postgres, seeds it, and runs an **OWASP ZAP baseline scan**, publishing SARIF to the Security tab plus a report artefact. On pull requests it also runs GitHub's dependency review, failing on high and critical advisories.
+`.github/workflows/security.yml` boots the real API against Postgres, seeds it, and runs an **OWASP ZAP baseline scan**, publishing SARIF to the Security tab plus a report artefact. On pull requests it also runs GitHub's dependency review as a *report* — see below for why it does not block.
 
 `release.yml` builds and pushes the container image to GHCR and queues EAS builds on a tag push.
+
+### Supply chain
+
+The blocking gate is `node scripts/audit-runtime.mjs`, and it is deliberately narrower than `npm audit`.
+
+A whole-workspace audit on this repo reports 63 high/critical advisories — and essentially all of them are in the Expo / React Native / Metro / Jest / Vitest toolchain, which runs on developer and CI machines and is in neither the server bundle nor the app binary. The spec pins Expo SDK 52 and React Native 0.76, so blocking on those keeps the gate red on every PR no matter what the PR changes, and a gate that is always red is a gate people learn to ignore.
+
+So the script walks **`packages/api`'s production dependency subtree** from the lockfile's own edges — 240 packages — and fails on any high or critical advisory in it. `npm ls --workspace` cannot do this: in a hoisted workspace it reports the shared tree and declares Expo and Jest "shipped". Advisories outside the subtree are still printed, just not blocking.
+
+Anything accepted must be written into the allow-list **with a reason**, and the script fails if an entry has none. There is currently exactly one:
+
+| Package | Severity | Why it is accepted |
+|---|---|---|
+| `@fastify/static` | high | Serves only the bundled Swagger UI assets. The patched release ships with `@fastify/swagger-ui` 6.x, which requires **Fastify 6**; this repo is on Fastify 5. Retires with that migration. |
+
+Two advisories in the shipped tree were fixed rather than accepted:
+
+- **`sharp` 0.33.5 → 0.35.5** (libvips CVEs). This was the one that genuinely mattered: it parses **untrusted user-uploaded images**. The upgrade changed the ESM type shape — the callable moved to a default export, so `typeof import('sharp')` stopped having call signatures — and the loader now names it explicitly. A real libvips round-trip in the test suite means the next upgrade fails in CI, not in production.
+- **`drizzle-orm` 0.38.4 → 0.45.4** (SQL injection via improperly escaped identifiers). Exposure here was nil — the codebase has no `sql.raw` and builds no dynamic identifiers, every `orderBy` uses imported column objects — but the upgrade was clean and removes the only flagged direct dependency. It did change behaviour underneath us; see the decimal regression in [Testing](#testing).
+
+After both, the shipped API runtime tree has **no unaccepted high or critical advisory**. Proving the gate can still bite: emptying the allow-list makes it exit 1 on `@fastify/static`, and `--all` makes it exit 1 on the 62 toolchain advisories.
 
 ### Load testing
 
@@ -417,19 +438,19 @@ rather than silently succeeding.
 
 ## Testing
 
-**647 tests**, and all three packages — `shared`, `api` and `mobile` — typecheck with **zero errors** under `strict` + `noUncheckedIndexedAccess`.
+**666 tests**, and all three packages — `shared`, `api` and `mobile` — typecheck with **zero errors** under `strict` + `noUncheckedIndexedAccess`.
 
 ```bash
 npm test                                    # everything, via turbo
 npm run typecheck                           # shared + api + mobile
 
 cd packages/shared && npx vitest run        #  69 contract tests
-cd packages/api    && npx vitest run        # 344 unit tests
-cd packages/api    && npm run test:e2e      # 147 integration tests (needs Postgres)
+cd packages/api    && npx vitest run        # 362 unit tests
+cd packages/api    && npm run test:e2e      # 148 integration tests (needs Postgres)
 cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobile tests
 ```
 
-500 run anywhere. The **147 integration tests** boot the real Fastify app and drive it with `app.inject()`, so they need PostgreSQL — `npm run db:up` locally, or let CI's service containers provide it. When no database is reachable they **skip loudly** rather than passing vacuously, because a green run that exercised nothing would be believed.
+518 run anywhere. The **148 integration tests** boot the real Fastify app and drive it with `app.inject()`, so they need PostgreSQL — `npm run db:up` locally, or let CI's service containers provide it. When no database is reachable they **skip loudly** rather than passing vacuously, because a green run that exercised nothing would be believed.
 
 
 | Suite | Cases | Covers |
@@ -441,6 +462,7 @@ cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobi
 | `nutrition` | 40 | Mifflin–St Jeor targets, goal ordering, macro splits, clinical clamping, macro verification |
 | `pagination` | 40 | Page clamping, offsets, cursors, ETags, field selection |
 | `openapi` | 6 | **The generated spec actually describes the API:** >80 paths, every resource tag represented, the endpoints a client integrates against first, bearer auth, the `{ data, meta }` envelope, and `/docs/json` serving the same document |
+| `image` | 18 | **Upload admission.** Magic bytes decide, never the `Content-Type` header: forged `image/jpeg` over arbitrary bytes is refused, a GIF wearing a JPEG label is refused by its own header, allowed formats pass, and empty/oversized get 400/413. Plus a real libvips round-trip so a `sharp` upgrade fails here rather than in production |
 | `cost` | 24 | Model pricing resolution including dated suffixes, per-call cost, token estimation |
 | `format` + `parse` | 61 | Every user-facing number: money, weight, CO₂, dates, quantities |
 | `i18n` | 18 | Catalogue parity across en/es (411 keys each): missing keys, orphans, empty strings, placeholder mismatches, untranslated copies, locale-tag resolution |
@@ -449,7 +471,7 @@ cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobi
 | **`e2e/auth`** | 28 | Refresh-token **rotation**, a rotated token rejected on replay, forged tokens getting 401 while non-token-shaped stubs get 422, malformed tokens never 500ing, forgot-password unable to enumerate accounts, no hash or Stripe id in the profile |
 | **`e2e/pantry`** | 26 | Derived expiry fields, shelf-life estimation, ownership returning **404 not 403**, out-of-range limits rejected while the documented maximum is accepted, the free-tier 50-item cap |
 | **`e2e/recipes`** | 22 | Generation in mock mode, pantry-match ratios agreeing with their own counts, and **a declared allergen never appearing** in any title, ingredient, substitute or step |
-| **`e2e/planning`** | 20 | 7-day plans, the ±10% nutrition verification report, day cards carrying the date/label/today flag they render, the week overview exposing its grocery list, every list endpoint using one `{ data, meta }` envelope, grocery lines always priced > 0, duplicate lines merged, price comparison gated 403 on free |
+| **`e2e/planning`** | 21 | 7-day plans, the ±10% nutrition verification report, day cards carrying the date/label/today flag they render, the week overview exposing its grocery list, every list endpoint using one `{ data, meta }` envelope, grocery lines always priced > 0, duplicate lines merged, **every NUMERIC column arriving as a JS number rather than a string**, price comparison gated 403 on free |
 | **`e2e/insights`** | 41 | Waste derived server-side, CO₂e scaling and meat-vs-vegetable ordering, impact equivalents, achievement progress bounds, the public pricing table, simulated checkout |
 
 The test suite has already earned its keep — it found **eight real bugs**, including two safety ones:
@@ -470,7 +492,13 @@ Running the suite against a real PostgreSQL 18 server, and typechecking the **mo
 
 > **The Recipes tab was permanently empty.** `GET /recipes` flattened its pagination onto the top level while every other list endpoint used `{ data, meta }`. The client helper unwrapped `data`, so the screen read `.items` off an array and got `undefined` — an empty list, with no error anywhere. The endpoint now uses the standard envelope, and `buildQuery`/`normalizePage` are unit-tested because they are the single point where this class of bug lives.
 
+> **A forged `Content-Type` admitted arbitrary bytes.** `validateImageInput` fell back to the *declared* MIME type whenever magic-byte sniffing found nothing, so shell-script bytes labelled `image/jpeg` passed the allow-list and were forwarded to a vision provider and written to storage. The mismatch branch beneath it even logged "using sniffed type" while continuing to use the declared one. Sniffing is now a requirement, not a cross-check, and 18 tests pin upload admission.
+
+> **Every decimal silently became a string.** Upgrading `drizzle-orm` to 0.45 (for the SQL-injection advisory) changed `PgNumeric.mapFromDriverValue` to coerce NUMERIC to a string, overriding the global `pg` type parser the schema had been relying on. Nothing threw: `existing.quantity + input.quantity` became concatenation, the merged grocery line turned into `NaN`, and the API told the shopper to buy **0 g of flour**. All 41 decimal columns now declare `mode: 'number'` — the supported mechanism — and an integration test asserts NUMERIC arrives as a JS number across quantities, prices and savings.
+
 > **`/docs` documented three endpoints.** `@fastify/swagger` assembles the spec from an `onRoute` hook, so it only sees routes registered *after* it — and the docs plugin was registered last, on the reasonable-sounding theory that the route schemas had to exist first. The document came out with its own `openapi.json` route, the upload wildcard and the service banner, and none of the ~90 real endpoints. Swagger UI still rendered and looked complete, and the integration harness boots with `skipDocs: true`, so nothing complained. The spec is now 98 paths / 110 operations across all 13 tags, with a test that builds the app the way `server.ts` does and counts them.
+
+Two CI jobs were also broken in a way that made them look like real failures: `npx vitest run --config packages/api/vitest.config.ts --root packages/api` never started, because vitest resolves `--config` *relative to* `--root` and looked for `packages/api/packages/api/vitest.config.ts` — so the unit and integration jobs died at startup without running a single test. And the ZAP job polled `localhost:4000` while `PORT` defaults to **8080**, so the server booted fine and the scan reported it as broken.
 
 Also caught: five list endpoints (`/meal-plans`, `/grocery-lists`, `/recipes/favorites`, `/recipes/history`, `/recipes`) each inventing their own pagination shape; `WeekOverviewDto` never exposing `grocery_list_id`, so the Plan screen's "open your shopping list" shortcut had nothing to open; `GET /meal-plans/:id/days` returning `date: null` and no day label, leaving the calendar cards with empty headers and no "today" highlight; per-achievement `points` computed server-side but never sent, so the "+N pts" badge could not render; a non-multipart upload to `/scan/fridge` returning **500** instead of 415; `waste/stats` breaking its own `YYYY-MM-DD` contract by returning full timestamps; two Ionicons glyph names that do not exist (`ice-cube-outline`, `filing-outline`), rendering blank icons on the freezer and pantry rows; `StatCard` imported from a path it does not live at, in four screens; and four DTO fields (`cooking_skill_level`, `dietary_preference`, `health_goal`, `activity_level`, `added_via`) typed as loose `string` while the database columns are real enums — which is what made the preferences bug invisible to the compiler.
 

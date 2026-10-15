@@ -13,7 +13,11 @@ import { logger } from './logger.js';
  * binary can still import this module.
  */
 
-type SharpModule = typeof import('sharp');
+// sharp >= 0.34 ships separate ESM and CJS type definitions. The ESM one
+// (`index.d.mts`) declares the callable as a *default* export, so
+// `typeof import('sharp')` is now a namespace with no call signatures and the
+// loader below has to name the default export explicitly.
+type SharpModule = typeof import('sharp').default;
 
 let sharpModule: SharpModule | null = null;
 let sharpLoadAttempted = false;
@@ -69,17 +73,31 @@ export function validateImageInput(buffer: Buffer, mimeType: string | undefined,
   const sniffed = sniffMimeType(buffer);
   const declared = mimeType?.split(';')[0]?.trim().toLowerCase();
 
-  if (!declared && !sniffed) throw new UnsupportedMediaTypeError('Could not determine the image type');
-  const effective = declared ?? sniffed ?? '';
-
-  if (!allowed.includes(effective)) {
+  // The magic bytes decide; the Content-Type header never does.
+  //
+  // A declared type is trivially forged. `content-type: image/jpeg` on a body of
+  // arbitrary bytes used to satisfy the allow-list here, because the check fell
+  // back to `declared` whenever sniffing found nothing — so the payload was
+  // admitted, forwarded to a vision provider and written to storage without
+  // ever having been an image. The mismatch branch below it even logged "using
+  // sniffed type" while continuing to use the declared one. Sniffing is now a
+  // requirement rather than a cross-check.
+  if (!sniffed) {
     throw new UnsupportedMediaTypeError(
-      `Unsupported image type "${effective}". Allowed: ${allowed.join(', ')}`,
+      declared
+        ? `File is not a recognisable image (declared "${declared}")`
+        : 'Could not determine the image type — no recognisable image header',
     );
   }
-  if (sniffed && sniffed !== effective) {
-    // Declared type disagrees with the magic bytes — trust the bytes.
-    logger.warn({ declared: effective, sniffed }, 'Image MIME mismatch; using sniffed type');
+
+  if (!allowed.includes(sniffed)) {
+    throw new UnsupportedMediaTypeError(
+      `Unsupported image type "${sniffed}". Allowed: ${allowed.join(', ')}`,
+    );
+  }
+
+  if (declared && declared !== sniffed) {
+    logger.warn({ declared, sniffed }, 'Image MIME mismatch; trusting the magic bytes');
   }
 }
 

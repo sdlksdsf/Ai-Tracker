@@ -493,7 +493,64 @@ describe.skipIf(!available)('grocery lists', () => {
     // shopper discovers in aisle four.
     const flour = refreshed.items.filter((item) => /flour/i.test(item.ingredient_name));
     expect(flour).toHaveLength(1);
+    // Named separately from the total: if NUMERIC ever comes back as a string,
+    // the merge above fails with a confusing "expected '500500' to be 1000"
+    // instead of pointing at the type.
+    expect(typeof flour[0]!.quantity, 'merged quantity must be a JS number').toBe('number');
     expect(flour[0]!.quantity).toBe(1000);
+  });
+
+  it('returns every NUMERIC column as a JS number, not a string', async () => {
+    // drizzle >= 0.44 coerces a plain `decimal()` / `numeric()` to a *string* in
+    // its own mapFromDriverValue, which overrides the pg type parser. Every
+    // decimal column in the schema therefore declares `mode: 'number'`.
+    //
+    // Losing that is silent and destructive: `existing.quantity + input.quantity`
+    // becomes string concatenation, the merged total turns into NaN, and the
+    // shopper is told to buy 0 g of flour. Prices and calories go the same way.
+    const created = data<GroceryListDto>(
+      await harness!.post(
+        '/api/v1/grocery-lists/generate',
+        {
+          items: [
+            { ingredient_name: 'plain flour', quantity: 500.5, unit: 'g', category: 'grain' },
+            { ingredient_name: 'olive oil', quantity: 1.25, unit: 'l', category: 'oil_fat' },
+          ],
+        },
+        user.accessToken,
+      ),
+    );
+
+    expect(created.items.length).toBeGreaterThan(0);
+
+    for (const item of created.items) {
+      if (item.quantity != null) {
+        expect(typeof item.quantity, `${item.ingredient_name} quantity`).toBe('number');
+        expect(Number.isFinite(item.quantity), `${item.ingredient_name} quantity`).toBe(true);
+      }
+      for (const field of ['estimated_price', 'actual_price'] as const) {
+        const value = item[field];
+        if (value != null) {
+          expect(typeof value, `${item.ingredient_name} ${field}`).toBe('number');
+          expect(Number.isFinite(value), `${item.ingredient_name} ${field}`).toBe(true);
+        }
+      }
+    }
+
+    // The column is numeric(8,2), so a fractional quantity must survive intact
+    // rather than being truncated or stringified.
+    expect(created.items.find((item) => /flour/i.test(item.ingredient_name))?.quantity).toBe(500.5);
+
+    for (const field of ['total_estimated_cost', 'total_actual_cost'] as const) {
+      const value = created[field];
+      if (value != null) expect(typeof value, field).toBe('number');
+    }
+
+    if (created.savings) {
+      for (const field of ['single_store_total', 'optimized_total', 'saved', 'percent'] as const) {
+        expect(typeof created.savings[field], `savings.${field}`).toBe('number');
+      }
+    }
   });
 
   it('gates price comparison behind a paid tier', async () => {

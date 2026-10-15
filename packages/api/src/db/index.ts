@@ -15,9 +15,18 @@ export type Database = NodePgDatabase<typeof schema>;
 
 const { Pool, types } = pg;
 
-// Return NUMERIC as a JS number instead of a string — every `decimal(..., { mode: 'number' })`
-// column in the schema relies on this. Precision loss beyond 15 digits is not a
-// concern for currency/nutrition values.
+// Return NUMERIC and INT8 as JS numbers instead of strings.
+//
+// Typed columns no longer depend on this — every `decimal(...)` in the schema
+// declares `mode: 'number'`, and drizzle maps those through its own
+// `PgNumericNumber.mapFromDriverValue`. (It has to: since 0.44 drizzle coerces a
+// plain `numeric()`/`decimal()` to a *string* in `mapFromDriverValue`, which
+// overrides this parser. Relying on the parser alone silently turned every
+// quantity into a string, and `'500' + 500` broke grocery-line merging.)
+//
+// What still needs it is raw aggregate SQL — `sum()`, `avg()`, `count(*)` — which
+// comes back through no column mapping at all. Precision loss beyond 15 digits is
+// not a concern for currency/nutrition values.
 types.setTypeParser(types.builtins.NUMERIC, (value) => (value === null ? null : Number.parseFloat(value)));
 types.setTypeParser(types.builtins.INT8, (value) => Number.parseInt(value, 10));
 
