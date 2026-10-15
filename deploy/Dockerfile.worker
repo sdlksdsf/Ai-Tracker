@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1.7
+#
+# PlateMatch background worker image.
+#
+# Shares the API's build output — the same `dist/` contains both entrypoints — so
+# the two images cannot drift apart. Run this one with ENABLE_WORKER=true.
+#
+#   docker build -f deploy/Dockerfile.worker -t platematch/worker .
+
+ARG NODE_VERSION=22-alpine
+
+FROM node:${NODE_VERSION} AS base
+ENV npm_config_audit=false \
+    npm_config_fund=false \
+    TURBO_TELEMETRY_DISABLED=1
+WORKDIR /app
+
+
+FROM base AS deps
+RUN apk add --no-cache python3 make g++ vips-dev libc6-compat
+COPY package.json package-lock.json* ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/api/package.json ./packages/api/
+RUN npm ci --include=dev
+
+
+FROM deps AS build
+COPY tsconfig.base.json ./
+COPY packages/shared ./packages/shared
+COPY packages/api ./packages/api
+RUN npm run build --workspace=@platematch/api
+
+
+FROM node:${NODE_VERSION} AS runtime
+RUN apk add --no-cache vips \
+    && addgroup -g 1001 -S platematch \
+    && adduser -S platematch -u 1001 -G platematch
+
+WORKDIR /app
+ENV NODE_ENV=production \
+    ENABLE_WORKER=true \
+    ENABLE_CRONS=true \
+    LOG_PRETTY=false
+
+COPY package.json package-lock.json* ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/api/package.json ./packages/api/
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
+COPY --from=build /app/packages/api/dist ./packages/api/dist
+COPY --from=build /app/packages/api/drizzle ./packages/api/drizzle
+
+RUN chown -R platematch:platematch /app
+USER platematch
+
+# The worker opens no port, so there is nothing for a HEALTHCHECK to probe.
+# Liveness comes from the queue's own heartbeat and the orchestrator's process
+# supervision.
+
+WORKDIR /app/packages/api
+CMD ["node", "dist/worker.js"]

@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+#
+# PlateMatch API image.
+#
+# Four stages, because the two things that make this image slow to build are the
+# native modules (argon2, sharp) and the TypeScript compile — and neither result
+# belongs in the runtime layer.
+#
+#   base    shared node + npm settings
+#   deps    install the FULL dependency tree (native builds need dev tooling)
+#   build   bundle server/worker/migrate/seed with tsup
+#   runtime production deps only, dist + drizzle SQL, non-root, read-only ready
+#
+# Build from the repository root:
+#   docker build -f deploy/Dockerfile.api -t platematch/api .
+
+# ---------------------------------------------------------------------------
+ARG NODE_VERSION=22-alpine
+
+FROM node:${NODE_VERSION} AS base
+ENV npm_config_audit=false \
+    npm_config_fund=false \
+    TURBO_TELEMETRY_DISABLED=1
+WORKDIR /app
+
+
+# ---------------------------------------------------------------------------
+# deps — full install, with the build toolchain argon2 and sharp need.
+# ---------------------------------------------------------------------------
+FROM base AS deps
+
+# python3/make/g++ are needed to compile argon2's native binding; they are
+# dropped again because the runtime stage starts from a clean image.
+RUN apk add --no-cache python3 make g++ vips-dev libc6-compat
+
+COPY package.json package-lock.json* ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/api/package.json ./packages/api/
+
+RUN npm ci --include=dev
+
+
+# ---------------------------------------------------------------------------
+# build — copy sources and bundle.
+# ---------------------------------------------------------------------------
+FROM deps AS build
+
+COPY tsconfig.base.json ./
+COPY packages/shared ./packages/shared
+COPY packages/api ./packages/api
+
+# Fail the build on a type error rather than shipping a bundle that only breaks
+# at runtime.
+RUN npm run typecheck --workspace=@platematch/api
+
+RUN npm run build --workspace=@platematch/api
+
+
+# ---------------------------------------------------------------------------
+# runtime — production dependencies and the emitted bundles only.
+# ---------------------------------------------------------------------------
+FROM node:${NODE_VERSION} AS runtime
+
+# sharp needs libvips at runtime; curl is for the container healthcheck.
+RUN apk add --no-cache vips curl \
+    && addgroup -g 1001 -S platematch \
+    && adduser -S platematch -u 1001 -G platematch
+
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=4000 \
+    HOST=0.0.0.0 \
+    LOG_PRETTY=false
+
+COPY package.json package-lock.json* ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/api/package.json ./packages/api/
+
+# `--omit=dev` plus `--ignore-scripts` keeps the image small; sharp and argon2
+# ship prebuilt binaries for alpine, so no compile step is needed here.
+RUN npm ci --omit=dev --ignore-scripts \
+    && npm cache clean --force
+
+# Bundled entrypoints. @platematch/shared is inlined by tsup, so packages/shared
+# only needs its package.json (copied above) to satisfy the workspace link.
+COPY --from=build /app/packages/api/dist ./packages/api/dist
+
+# Migration SQL — `DATABASE_MIGRATE_ON_BOOT=true` and the `migrate` entrypoint
+# both read from here.
+COPY --from=build /app/packages/api/drizzle ./packages/api/drizzle
+COPY --from=build /app/packages/api/drizzle.config.ts ./packages/api/drizzle.config.ts
+
+# Local upload driver target. Only used when STORAGE_DRIVER=local; a volume
+# should be mounted here in that case.
+RUN mkdir -p /app/uploads && chown -R platematch:platematch /app/uploads /app
+
+USER platematch
+EXPOSE 4000
+
+# Liveness: /health answers 200 even when a dependency is degraded, so it is the
+# right probe for "is the process up". Use /health/ready for readiness.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:4000/health/live || exit 1
+
+WORKDIR /app/packages/api
+CMD ["node", "dist/server.js"]

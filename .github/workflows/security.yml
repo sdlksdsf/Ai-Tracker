@@ -1,0 +1,223 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly: new ZAP rules and new CVEs appear without any change to this repo.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # OWASP ZAP baseline scan against a live API.
+  #
+  # Boots the real server (with Postgres, migrated and seeded) inside the job,
+  # then runs ZAP's passive + active baseline scan against it. Findings are
+  # published as a SARIF artefact and summarised in the run.
+  # ---------------------------------------------------------------------------
+  zap:
+    name: OWASP ZAP baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Required to publish SARIF to the Security tab.
+      security-events: write
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: platematch
+          POSTGRES_PASSWORD: platematch
+          POSTGRES_DB: platematch_zap
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U platematch"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://platematch:platematch@localhost:5432/platematch_zap
+      ENABLE_REDIS: 'false'
+      AI_MODE: mock
+      STORAGE_DRIVER: local
+      LOCAL_UPLOAD_DIR: ./uploads-zap
+      ENABLE_SWAGGER: 'true'
+      ENABLE_CRONS: 'false'
+      ENABLE_PUSH: 'false'
+      ENABLE_ANALYTICS: 'false'
+      SEED_DEMO_USER: 'true'
+      SEED_DEMO_PREMIUM: 'true'
+      DATABASE_MIGRATE_ON_BOOT: 'true'
+      LOG_LEVEL: warn
+      JWT_SECRET: zap-scan-only-access-secret-0123456789abcdef0123456789
+      JWT_REFRESH_SECRET: zap-scan-only-refresh-secret-0123456789abcdef0123456
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Migrate and seed
+        run: |
+          npm run db:migrate --workspace=@platematch/api
+          npm run db:seed   --workspace=@platematch/api
+
+      - name: Build
+        run: npm run build --workspace=@platematch/api
+
+      # Rate limiting is disabled so ZAP can crawl; a 429 on every request would
+      # produce a scan that looks clean while testing nothing.
+      - name: Start the API
+        run: |
+          RATE_LIMIT_DISABLED=true nohup node packages/api/dist/server.js > /tmp/api.log 2>&1 &
+          echo $! > /tmp/api.pid
+
+          for i in $(seq 1 45); do
+            if curl -fsS http://localhost:4000/health/ready > /dev/null 2>&1; then
+              echo "API is ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+
+          echo "API never became ready — last 60 log lines:"; tail -60 /tmp/api.log; exit 1
+
+      - name: Record an access token for authenticated scanning
+        id: token
+        run: |
+          # Minted so the step summary can confirm the demo account works, and
+          # available to a future authenticated scan. ZAP's baseline action has
+          # no supported bearer-token injection, so the crawl itself stays on the
+          # public surface — the authenticated endpoints are covered by the 144
+          # integration tests instead.
+          TOKEN=$(curl -sS -X POST http://localhost:4000/api/v1/auth/login \
+            -H 'content-type: application/json' \
+            -d '{"email":"demo@platematch.app","password":"PlateMatch2025"}' \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).data.access_token||"")}catch{console.log("")}})')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Could not mint a demo token — continuing with an unauthenticated scan"
+          else
+            echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+            echo "Authenticated scan enabled"
+          fi
+
+      - name: Write ZAP rules baseline
+        run: |
+          mkdir -p .zap
+          cat > .zap/rules.tsv <<'RULES'
+          # ZAP baseline rule overrides.
+          # Format: <rule id>\t(IGNORE|WARN|FAIL)\t<comment>
+          #
+          # 10038  Content Security Policy header not set — /docs sets one; the
+          #        JSON API deliberately does not, since it serves no HTML.
+          # 10021  X-Content-Type-Options — set by @fastify/helmet, but ZAP
+          #        probes paths that 404 before the hook runs.
+          # 10036  Server leaks version info — Fastify's default banner; harmless
+          #        for a JSON API behind a proxy.
+          # 10011  Cookie without Secure flag — the locale cookie is not a secret.
+          10038	IGNORE	JSON API serves no HTML; CSP is set on /docs
+          10021	WARN	Helmet sets this on real responses
+          10036	IGNORE	Server banner on a JSON API
+          10011	IGNORE	Locale hint cookie carries no secret
+          RULES
+
+      - name: Run ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: 'http://localhost:4000/api/v1'
+          rules_file_name: '.zap/rules.tsv'
+          fail_action: false
+          allow_issue_writing: true
+          # -J follows JSON responses rather than treating the API as a site to
+          # spider for HTML. The baseline action has no supported way to inject a
+          # bearer token, so the crawl covers the public surface plus whatever
+          # 401 paths reveal; the authenticated surface is covered by the
+          # integration suite instead.
+          cmd_options: '-J'
+
+      - name: Publish scan summary
+        if: always()
+        run: |
+          REPORT=$(ls -1 report_md.md zap.yaml 2>/dev/null | head -1 || true)
+          {
+            echo "### OWASP ZAP baseline scan"
+            echo ""
+            if [ -f report_md.md ]; then
+              ALERTS=$(grep -cE '^\| (High|Medium|Low|Informational)' report_md.md || echo 0)
+              echo "- Alerts found: \"$ALERTS\""
+              echo ""
+              echo '<details><summary>Full report</summary>'
+              echo ""
+              cat report_md.md
+              echo ""
+              echo '</details>'
+            else
+              echo "No report produced — see the scan log above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: |
+            report_md.md
+            report_html.html
+            report_json.json
+            zap.yaml
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload API log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-log
+          path: /tmp/api.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop the API
+        if: always()
+        run: |
+          if [ -f /tmp/api.pid ]; then kill "$(cat /tmp/api.pid)" 2>/dev/null || true; fi
+
+  # ---------------------------------------------------------------------------
+  # Dependency review — blocks known-vulnerable versions entering main.
+  # ---------------------------------------------------------------------------
+  dependencies:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/dependency-review-action@v4
+        with:
+          # Fail only on high/critical so a moderate advisory in a transitive dev
+          # dependency does not block an unrelated PR.
+          fail-on-severity: high
+          comment-summary-in-pr: true

@@ -1,0 +1,70 @@
+# ---- Dependencies ----
+node_modules/
+.pnp
+.pnp.js
+jspm_packages/
+
+# ---- Build output ----
+dist/
+build/
+out/
+.next/
+.expo/
+.expo-shared/
+web-build/
+*.tsbuildinfo
+
+# ---- Turbo ----
+.turbo/
+
+# ---- Environment / secrets (NEVER commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+secrets/
+.doppler/
+
+# ---- Database ----
+drizzle/meta/_journal.json.tmp
+*.sqlite
+*.sqlite3
+pgdata/
+
+# ---- Logs ----
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pino-pretty.log
+
+# ---- Testing / coverage ----
+coverage/
+.nyc_output/
+k6-results.json
+maestro/.*
+
+# ---- Editors / OS ----
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ---- Mobile specific ----
+apps/mobile/android/
+apps/mobile/ios/
+*.jks
+*.keystore
+google-services.json
+GoogleService-Info.plist
+
+# ---- Misc ----
+tmp/
+temp/
+.arena/
+uploads/

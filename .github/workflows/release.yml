@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'EAS build profile'
+        required: true
+        default: 'preview'
+        type: choice
+        options: [development, preview, production]
+      platform:
+        description: 'Platforms to build'
+        required: true
+        default: 'all'
+        type: choice
+        options: [all, android, ios]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Publish the API image. Deploying it is a separate step in your own
+  # environment so a tag push cannot ship straight to production unreviewed.
+  # ---------------------------------------------------------------------------
+  api-image:
+    name: Build & push API image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/api
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.api
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # ---------------------------------------------------------------------------
+  # Mobile builds via EAS. Skipped when EXPO_TOKEN is not configured, so a fork
+  # without an Expo account still gets a green run.
+  # ---------------------------------------------------------------------------
+  mobile:
+    name: EAS build (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ vars.EXPO_TOKEN != '' || secrets.EXPO_TOKEN != '' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' && '["android","ios"]' || format('["{0}"]', github.event.inputs.platform)) || '["android","ios"]') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install eas-cli
+        run: npm install --global --no-save eas-cli@latest
+
+      - name: Build
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          eas build \
+            --platform ${{ matrix.platform }} \
+            --profile ${{ github.event.inputs.profile || 'preview' }} \
+            --non-interactive \
+            --no-wait \
+            --message "Release ${GITHUB_REF_NAME:-manual}"
+
+      - name: Summarise
+        run: |
+          {
+            echo "### EAS build queued"
+            echo ""
+            echo "- Platform: \`${{ matrix.platform }}\`"
+            echo "- Profile: \`${{ github.event.inputs.profile || 'preview' }}\`"
+            echo "- Trigger: \`${GITHUB_REF_NAME:-workflow_dispatch}\`"
+            echo ""
+            echo "Track it at https://expo.dev/accounts — the build continues on Expo's servers."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # GitHub release notes
+  # ---------------------------------------------------------------------------
+  release-notes:
+    name: Publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: api-image
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PREVIOUS=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || echo "")
+          if [ -n "$PREVIOUS" ]; then
+            NOTES=$(git log --pretty=format:'- %s (%h)' "$PREVIOUS..${GITHUB_REF_NAME}")
+          else
+            NOTES=$(git log --pretty=format:'- %s (%h)' "${GITHUB_REF_NAME}")
+          fi
+
+          {
+            echo "## PlateMatch ${GITHUB_REF_NAME}"
+            echo ""
+            echo "### Changes"
+            echo "$NOTES"
+            echo ""
+            echo "### Container image"
+            echo "\`ghcr.io/${GITHUB_REPOSITORY}/api:${GITHUB_REF_NAME#v}\`"
+          } > /tmp/notes.md
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "PlateMatch ${GITHUB_REF_NAME}" \
+            --notes-file /tmp/notes.md \
+            --generate-notes=false

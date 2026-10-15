@@ -1,0 +1,45 @@
+{
+  "name": "platematch",
+  "version": "2.0.0",
+  "private": true,
+  "description": "PlateMatch — AI-powered meal planner, fridge scanner and food-waste reducer.",
+  "license": "MIT",
+  "author": "PlateMatch Team",
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "packageManager": "npm@10.9.8",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "dev:api": "turbo run dev --filter=@platematch/api",
+    "dev:mobile": "turbo run dev --filter=@platematch/mobile",
+    "worker": "turbo run worker --filter=@platematch/api",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:e2e": "turbo run test:e2e --filter=@platematch/api",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "db:generate": "turbo run db:generate --filter=@platematch/api",
+    "db:migrate": "turbo run db:migrate --filter=@platematch/api",
+    "db:seed": "turbo run db:seed --filter=@platematch/api",
+    "db:studio": "turbo run db:studio --filter=@platematch/api",
+    "db:up": "docker compose up -d postgres redis",
+    "db:down": "docker compose down",
+    "format": "prettier --write \"**/*.{ts,tsx,md,json,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,md,json,yml,yaml}\"",
+    "audit": "npm audit --omit=dev --workspaces",
+    "prepare": "husky || true"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "prettier": "^3.4.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
+  }
+}

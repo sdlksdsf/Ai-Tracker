@@ -1,0 +1,66 @@
+name: Mobile preview
+
+on:
+  pull_request:
+    paths:
+      - 'apps/mobile/**'
+      - 'packages/shared/**'
+      - '.github/workflows/mobile-preview.yml'
+
+# One preview per PR head; a force-push replaces it.
+concurrency:
+  group: mobile-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  web-preview:
+    name: Expo web preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Catches broken imports and missing modules across the whole app graph —
+      # the failures typechecking cannot see.
+      - name: Export web bundle
+        working-directory: apps/mobile
+        run: npx expo export --platform web --output-dir dist-web
+        continue-on-error: true
+
+      - name: Report
+        if: always()
+        run: |
+          if [ -d apps/mobile/dist-web ]; then
+            SIZE=$(du -sh apps/mobile/dist-web | cut -f1)
+            FILES=$(find apps/mobile/dist-web -type f | wc -l)
+            {
+              echo "### Mobile web export"
+              echo ""
+              echo "- Size: \`$SIZE\`"
+              echo "- Files: \`$FILES\`"
+              echo ""
+              echo "The bundle built successfully. Download the artefact to inspect it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Mobile web export" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No bundle produced — check the log above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-web-bundle
+          path: apps/mobile/dist-web
+          if-no-files-found: ignore
+          retention-days: 7
