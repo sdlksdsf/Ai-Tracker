@@ -49,6 +49,11 @@ export async function recipeRoutes(app: FastifyInstance): Promise<void> {
         'Every candidate is re-checked against the allergen guard before it is returned, and ' +
         'anything unsafe is disqualified at the recipe level rather than silently edited.',
       body: jsonSchemaFrom(generateRecipesSchema),
+      // 200, not 201 — and deliberately different from POST /meal-plans/generate.
+      // A generation can be served from the prompt cache (`model=cache`) and create
+      // nothing at all, so promising 201 Created here would be a lie on cache hits.
+      // Meal-plan generation always persists a plan, its entries and a grocery list,
+      // so 201 is correct there. Both codes are declared in the OpenAPI document.
       response: { 200: { type: 'object', properties: { data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
