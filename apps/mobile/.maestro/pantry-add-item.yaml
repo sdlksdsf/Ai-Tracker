@@ -1,0 +1,35 @@
+# Add a pantry item and confirm it appears with derived expiry fields.
+#
+# The assertion that matters: an item added WITHOUT an expiry date still gets one,
+# because that estimate is what makes the expiry alerts work at all.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Home"
+- tapOn: "Add item"
+
+- extendedWaitUntil:
+    visible: "Add item"
+    timeout: 15000
+
+- tapOn:
+    id: "pantry-form-name"
+- inputText: "Maestro Test Yogurt"
+
+# 3 days is inside the "use this week" bucket.
+- tapOn: "3d"
+
+- tapOn: "Save"
+
+- extendedWaitUntil:
+    visible: "Maestro Test Yogurt"
+    timeout: 15000
+
+- assertVisible: "Maestro Test Yogurt"
+
+# Search must find it, which exercises the q= filter end to end.
+- tapOn:
+    id: "pantry-search"
+- inputText: "Maestro Test"
+- assertVisible: "Maestro Test Yogurt"

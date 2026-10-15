@@ -1,0 +1,35 @@
+# Generate recipes from the pantry in AI_MODE=mock.
+#
+# The critical assertion is the negative one: the demo account declares a severe
+# peanut allergy, so no generated recipe may mention peanuts anywhere.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Recipes"
+
+- extendedWaitUntil:
+    visible: "What can I cook?"
+    timeout: 15000
+
+- tapOn:
+    id: "recipes-generate-hero"
+
+- extendedWaitUntil:
+    visible: "Generate recipes"
+    timeout: 15000
+
+# The allergen guarantee is stated on the sheet itself.
+- assertVisible: "re-checked against your allergies"
+
+- tapOn: "Use my pantry"
+- tapOn: "Generate recipes"
+
+# Mock mode is deterministic and local, so this should be quick; allow generous
+# headroom for a cold start on a slow emulator.
+- extendedWaitUntil:
+    visible: ".*min.*|servings"
+    timeout: 90000
+
+- assertNotVisible: "peanut"
+- assertNotVisible: "Peanut"

@@ -1,0 +1,93 @@
+{
+  "expo": {
+    "name": "PlateMatch",
+    "slug": "platematch",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "platematch",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#2D8F4E"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.platematch.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "PlateMatch uses the camera to photograph your fridge and pantry so it can identify what you already have and suggest recipes that use it up before it expires.",
+        "NSPhotoLibraryUsageDescription": "PlateMatch can analyse a photo from your library to identify ingredients for your pantry.",
+        "NSPhotoLibraryAddUsageDescription": "PlateMatch can save generated meal plans and grocery lists to your photos.",
+        "NSUserNotificationsUsageDescription": "PlateMatch sends expiry alerts, meal reminders and your weekly savings report."
+      },
+      "config": {
+        "usesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "app.platematch.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#2D8F4E"
+      },
+      "permissions": ["CAMERA", "POST_NOTIFICATIONS", "READ_MEDIA_IMAGES"],
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-localization",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "PlateMatch uses the camera to scan your fridge and pantry."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "PlateMatch can analyse a photo from your library to identify ingredients."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#2D8F4E",
+          "defaultChannel": "platematch-default",
+          "sounds": []
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#2D8F4E",
+          "image": "./assets/splash.png",
+          "imageWidth": 200
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "platematch-mobile"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/platematch-mobile"
+    }
+  }
+}

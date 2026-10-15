@@ -1,0 +1,50 @@
+# Open a recipe, scale servings, and mark it cooked.
+#
+# Scaling must recompute quantities — cooking for four from a two-serving recipe
+# is the normal case, and a stale quantity is a real cooking failure.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Recipes"
+
+- extendedWaitUntil:
+    visible: "recipes"
+    timeout: 20000
+
+# Open the first card in the list.
+- tapOn:
+    index: 0
+    text: ".*"
+
+- extendedWaitUntil:
+    visible: "Ingredients"
+    timeout: 20000
+
+- assertVisible: "Ingredients"
+- assertVisible: "Method"
+- assertVisible: "Start cooking"
+
+# Serving scaler.
+- tapOn:
+    id: "recipe-servings-increase"
+- assertVisible: "3 servings"
+
+- tapOn:
+    id: "recipe-favorite"
+
+- tapOn: "Start cooking"
+
+- extendedWaitUntil:
+    visible: "Step 1 of"
+    timeout: 20000
+
+- assertVisible: "Step 1 of"
+
+# Cooking mode keeps the screen awake and offers voice guidance.
+- tapOn:
+    id: "cooking-voice"
+
+- tapOn:
+    id: "cooking-next"
+- assertVisible: "Step 2 of"

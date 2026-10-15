@@ -1,0 +1,32 @@
+# The Home screen must render every block from one /dashboard/home call.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- extendedWaitUntil:
+    visible: "Money saved"
+    timeout: 20000
+
+- assertVisible: "Money saved"
+- assertVisible: "CO₂ avoided|CO₂"
+- assertVisible: "Streak"
+- assertVisible: "Your pantry"
+
+# Quick actions are the primary path into the three core loops.
+- assertVisible: "Scan fridge"
+- assertVisible: "Add item"
+
+# Pull to refresh must not blank the screen.
+- swipe:
+    direction: DOWN
+- assertVisible: "Money saved"
+
+# Navigate to each tab and back, proving the tab bar is wired.
+- tapOn: "Recipes"
+- assertVisible: "What can I cook?|Recipes"
+- tapOn: "Plan"
+- assertVisible: "Meal plan|Plan my week"
+- tapOn: "Profile"
+- assertVisible: "Your impact|Subscription"
+- tapOn: "Home"
+- assertVisible: "Money saved"

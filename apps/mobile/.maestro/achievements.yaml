@@ -1,0 +1,25 @@
+# Locked badges must show progress, not disappear.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Profile"
+
+- extendedWaitUntil:
+    visible: "Your impact|Badges"
+    timeout: 20000
+
+- tapOn: "Achievements"
+
+- extendedWaitUntil:
+    visible: "Badges|Level"
+    timeout: 20000
+
+- assertVisible: "pts"
+
+# Filtering to "In progress" must still render badges with their progress —
+# that is the motivation mechanic.
+- tapOn: "In progress"
+- extendedWaitUntil:
+    visible: ".*\\/.*"
+    timeout: 15000

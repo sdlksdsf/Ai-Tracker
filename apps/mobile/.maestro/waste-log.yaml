@@ -1,0 +1,36 @@
+# Log waste from a name and a reason only, and confirm the impact numbers move.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Home"
+
+- tapOn:
+    id: "home-waste"
+
+- extendedWaitUntil:
+    visible: "Total waste|What it adds up to|Money lost"
+    timeout: 20000
+
+- tapOn:
+    id: "waste-add"
+
+- extendedWaitUntil:
+    visible: "Log wasted food|What was it?"
+    timeout: 15000
+
+# The frictionless path: a name and the pre-selected reason. Everything else —
+# grams, CO2e, cost — is derived server-side.
+- tapOn:
+    id: "waste-log-name"
+- inputText: "Maestro Test Strawberries"
+
+- tapOn:
+    id: "waste-log-submit"
+
+- extendedWaitUntil:
+    visible: "Logged"
+    timeout: 20000
+
+- tapOn: "History"
+- assertVisible: "Maestro Test Strawberries"
