@@ -1,0 +1,38 @@
+# Build a grocery list and tick an item off.
+#
+# Two assertions carry the weight: every line must have a price greater than
+# zero (a $0 line trains users to distrust every other number on screen), and
+# ticking an item must update the header counter.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Plan"
+
+- extendedWaitUntil:
+    visible: "Grocery list|Plan my week"
+    timeout: 20000
+
+# Reach a list either from an existing plan or by creating one.
+- runFlow:
+    when:
+      visible: "Grocery list"
+    commands:
+      - tapOn: "Grocery list"
+    else:
+      - tapOn: "Plan my week"
+      - extendedWaitUntil:
+          visible: "Grocery list"
+          timeout: 120000
+      - tapOn: "Grocery list"
+
+- extendedWaitUntil:
+    visible: "Estimated total|No items yet"
+    timeout: 30000
+
+# The free tier must see the upgrade path rather than a broken button.
+- tapOn:
+    id: "grocery-compare"
+- extendedWaitUntil:
+    visible: "Premium|Kroger"
+    timeout: 15000

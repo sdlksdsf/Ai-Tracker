@@ -1,0 +1,20 @@
+# Shared Maestro configuration.
+#
+# Every flow below signs in with the seeded demo account, so the suite is
+# self-contained: `npm run db:seed` on the API and these flows have a populated
+# pantry, 34 recipes and a declared peanut allergy to work against.
+appId: app.platematch.mobile
+---
+executionOrder:
+  continueOnFailure: false
+  flowsOrder:
+    - auth-sign-in
+    - home-renders
+    - pantry-add-item
+    - recipes-generate
+    - recipe-detail-and-cook
+    - meal-plan-generate
+    - grocery-list
+    - waste-log
+    - achievements
+    - premium-gate

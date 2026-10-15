@@ -1,0 +1,32 @@
+# Generate a weekly meal plan and confirm the nutrition verification is shown.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Plan"
+
+- extendedWaitUntil:
+    visible: "Plan my week|Regenerate"
+    timeout: 20000
+
+- tapOn: "Plan my week|Regenerate"
+
+- extendedWaitUntil:
+    visible: "How many days?"
+    timeout: 15000
+
+# The allergen guarantee must be stated before generation, not after.
+- assertVisible: "allergies and dietary preference are enforced"
+
+- tapOn: "3 days"
+- tapOn: "Plan my week"
+
+# Local generation is fast; a live model would take longer.
+- extendedWaitUntil:
+    visible: "This week|avg kcal/day"
+    timeout: 120000
+
+- assertVisible: "Daily target|avg kcal/day"
+
+# Seven day cards must render even when some days have no meals.
+- assertVisible: "Mon|Monday"

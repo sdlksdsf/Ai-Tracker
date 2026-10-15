@@ -1,0 +1,32 @@
+# The Premium screen must pitch with the user's OWN quota usage, and must be
+# honest when Stripe is not configured.
+appId: app.platematch.mobile
+---
+- launchApp
+
+- tapOn: "Profile"
+
+- extendedWaitUntil:
+    visible: "Subscription"
+    timeout: 20000
+
+- tapOn: "Subscription"
+
+- extendedWaitUntil:
+    visible: "PlateMatch Premium"
+    timeout: 20000
+
+- assertVisible: "Unlimited fridge scans"
+- assertVisible: "Multi-store price comparison"
+
+# The free tier is ad-supported; the screen must not claim otherwise.
+- assertNotVisible: "no ads on any plan"
+
+# Usage block proves the pitch is personalised rather than generic copy.
+- assertVisible: "Where you are this week|Fridge scans"
+
+- tapOn: "Yearly"
+- assertVisible: "You save"
+
+- tapOn: "Family"
+- assertVisible: "Shared household"

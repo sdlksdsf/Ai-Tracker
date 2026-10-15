@@ -1,0 +1,31 @@
+# Sign in with the seeded demo account.
+#
+# This is the first flow every other one depends on: a signed-out app renders the
+# auth stack, so the pantry and recipe assertions would all fail.
+appId: app.platematch.mobile
+---
+- launchApp:
+    clearState: true
+
+- extendedWaitUntil:
+    visible: "Welcome back"
+    timeout: 30000
+
+- tapOn:
+    id: "login-email"
+- inputText: "demo@platematch.app"
+
+- tapOn:
+    id: "login-password"
+- inputText: "PlateMatch2025"
+
+- tapOn:
+    id: "login-submit"
+
+# The root layout holds the splash until the session resolves, so the first thing
+# visible after sign-in is the Home greeting rather than a login flash.
+- extendedWaitUntil:
+    visible: "Use these first|Nothing is about to expire"
+    timeout: 30000
+
+- assertNotVisible: "Welcome back"

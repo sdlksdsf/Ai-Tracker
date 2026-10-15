@@ -1,0 +1,306 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run that is still going.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Turborepo remote caching is off; the actions/cache entries below are enough
+  # and do not need a Vercel account.
+  TURBO_TELEMETRY_DISABLED: '1'
+  TURBO_FORCE_COLOR: '1'
+  npm_config_audit: 'false'
+  npm_config_fund: 'false'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Static checks — no services, so this reports in about two minutes.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Typecheck & lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `--ignore-scripts` skips the Expo prebuild; native modules are not needed
+      # to typecheck, and skipping them keeps this job fast and hermetic.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Prettier
+        run: npx prettier --check "**/*.{ts,tsx,md,json,yml,yaml}" --log-level warn
+        continue-on-error: true
+
+      - name: Typecheck shared
+        run: npx tsc --noEmit -p packages/shared/tsconfig.json
+
+      - name: Typecheck api
+        run: npx tsc --noEmit -p packages/api/tsconfig.json
+
+      # The app people actually install. Typechecking only the server half let
+      # 316 errors accumulate here unnoticed — including screens importing a
+      # component from a path it does not live at.
+      - name: Typecheck mobile
+        run: npx tsc --noEmit -p apps/mobile/tsconfig.json
+
+      - name: Lint api
+        run: npm run lint --workspace=@platematch/api --if-present
+        continue-on-error: true
+
+      # BLOCKING supply-chain gate, scoped to what actually ships.
+      #
+      # The whole-workspace `npm audit` is dominated by advisories in the Expo /
+      # React Native / Metro / Jest / Vitest toolchain — none of which is in the
+      # server bundle. Blocking on those keeps the gate permanently red (the spec
+      # pins Expo SDK 52 and React Native 0.76), and a gate that is always red is
+      # a gate people learn to ignore.
+      #
+      # This walks packages/api's *production* dependency subtree from the
+      # lockfile's own edges and fails on any high/critical advisory in it, minus
+      # an allow-list where every entry must carry a written reason. Reads only
+      # package-lock.json, so it needs no install.
+      - name: Audit the shipped API runtime tree
+        run: node scripts/audit-runtime.mjs
+
+  # ---------------------------------------------------------------------------
+  # Unit tests — pure logic, no database. Runs on every push.
+  # ---------------------------------------------------------------------------
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: verify
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # AI_MODE=mock forces the built-in deterministic engine, so no API keys are
+      # needed and the assertions are stable across runs.
+      - name: Test shared
+        run: npx vitest run --root packages/shared
+        env:
+          NODE_ENV: test
+          AI_MODE: mock
+
+      # `working-directory`, not `--root`: vitest resolves `--config` *relative
+      # to* `--root`, so `--config packages/api/... --root packages/api` looked
+      # for packages/api/packages/api/vitest.config.ts and the job died at
+      # startup without running a single test.
+      - name: Test api
+        run: npx vitest run --coverage
+        working-directory: packages/api
+        env:
+          NODE_ENV: test
+          AI_MODE: mock
+          ENABLE_REDIS: 'false'
+
+      # The mobile app's platform-independent modules (formatting, parsing,
+      # i18n catalogues) run in plain Node — no native toolchain required.
+      - name: Test mobile (pure modules)
+        run: npx vitest run --config vitest.pure.config.ts --root apps/mobile
+        env:
+          NODE_ENV: test
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-api
+          path: packages/api/coverage
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Integration tests — real Postgres 16 + Redis 7 service containers.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: verify
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: platematch
+          POSTGRES_PASSWORD: platematch
+          POSTGRES_DB: platematch_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U platematch"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://platematch:platematch@localhost:5432/platematch_test
+      REDIS_URL: redis://localhost:6379
+      ENABLE_REDIS: 'true'
+      AI_MODE: mock
+      STORAGE_DRIVER: local
+      JWT_SECRET: ci-only-access-secret-0123456789abcdef
+      JWT_REFRESH_SECRET: ci-only-refresh-secret-0123456789abcdef
+      RATE_LIMIT_DISABLED: 'true'
+      LOG_LEVEL: warn
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Native modules (argon2, sharp) ARE needed here: the auth and image
+      # pipelines are under test.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -U platematch >/dev/null 2>&1; then
+              echo "Postgres is ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Postgres never became ready"; exit 1
+
+      - name: Apply migrations
+        run: npm run db:migrate --workspace=@platematch/api
+
+      - name: Verify the schema matches the migration files
+        # `drizzle-kit check` catches a schema.ts edit that was never generated
+        # into SQL — the drift that turns a green build into a broken deploy.
+        run: npx drizzle-kit check --config packages/api/drizzle.config.ts
+        continue-on-error: true
+
+      - name: Integration tests
+        run: npx vitest run --config vitest.e2e.config.ts
+        working-directory: packages/api
+
+      - name: Seed smoke test
+        # Proves a fresh database can be populated end to end, which is what a
+        # new contributor does first.
+        run: |
+          SEED_DEMO_USER=true npm run db:seed --workspace=@platematch/api
+          psql "$DATABASE_URL" -c "SELECT count(*) AS recipes FROM recipes;"
+
+  # ---------------------------------------------------------------------------
+  # Build — proves the artefacts actually compile and bundle.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: unit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build api bundles
+        run: npm run build --workspace=@platematch/api
+
+      - name: Verify entrypoints were emitted
+        run: |
+          for entry in server worker migrate seed; do
+            if [ ! -f "packages/api/dist/$entry.js" ]; then
+              echo "missing packages/api/dist/$entry.js"; exit 1
+            fi
+            echo "ok: $entry.js"
+          done
+
+      - name: Boot the server against no database
+        # The process must fail with a clear message rather than a stack trace
+        # from deep inside Drizzle.
+        run: |
+          set +e
+          DATABASE_URL=postgresql://invalid:invalid@127.0.0.1:1/none \
+            timeout 25 node packages/api/dist/server.js 2>&1 | tee /tmp/boot.log
+          grep -qi "cannot reach postgresql\|database" /tmp/boot.log \
+            && echo "ok: failed with a diagnostic message" \
+            || { echo "server did not report the database problem"; exit 1; }
+
+      - name: Export the mobile web bundle
+        # A real bundler pass over the RN app: catches bad imports and missing
+        # modules that typechecking alone would miss.
+        run: npx expo export --platform web --output-dir /tmp/mobile-web
+        working-directory: apps/mobile
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Supply chain
+  # ---------------------------------------------------------------------------
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Whole-tree report, non-blocking: the blocking gate is
+      # `Audit the shipped API runtime tree` in the verify job, which is scoped to
+      # packages/api's production subtree. Moderate and above only — the
+      # low-severity stream on a React Native tree is noise.
+      - name: npm audit (whole tree, reported)
+        run: npm audit --omit=dev --audit-level=moderate
+        continue-on-error: true
+
+      - name: Check for committed secrets
+        run: |
+          if git grep -nE "(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)" -- . ':!*.test.ts' ':!*.md'; then
+            echo "Possible secret committed — see matches above"; exit 1
+          fi
+          echo "ok: no secret patterns found"
