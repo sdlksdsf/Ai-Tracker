@@ -74,7 +74,19 @@ jobs:
     name: EAS build (${{ matrix.platform }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: ${{ vars.EXPO_TOKEN != '' || secrets.EXPO_TOKEN != '' }}
+    # Gate on a repository *variable*, not a secret.
+    #
+    # `secrets` is not an available context in a job-level `if:` — GitHub decides
+    # whether to create the job before any secret is exposed, so only
+    # github/needs/vars/inputs are in scope. Referencing `secrets` here is a
+    # workflow *validation* error, and it fails in the most confusing way
+    # possible: the run is created with zero jobs and the file path as its name,
+    # so every tag push looked broken with nothing to read.
+    #
+    # Set the `EAS_ENABLED` repository variable to `true` (and the `EXPO_TOKEN`
+    # secret) to turn mobile release builds on. Without it the job is skipped and
+    # a fork with no Expo account still gets a green release run.
+    if: ${{ vars.EAS_ENABLED == 'true' }}
 
     strategy:
       fail-fast: false

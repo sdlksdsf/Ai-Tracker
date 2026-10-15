@@ -11,7 +11,7 @@ A production-ready, cross-platform meal planner built to attack household food w
 [![CI](https://github.com/sdlksdsf/Ai-Tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/sdlksdsf/Ai-Tracker/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-3C873A?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-666-2D8F4E)](#testing)
+[![Tests](https://img.shields.io/badge/tests-679-2D8F4E)](#testing)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](#type-safety)
 
 **Runs with zero API keys.** Add a key for any one capability and only that capability goes live.
@@ -395,7 +395,7 @@ eas build --platform all --profile production
 
 `.github/workflows/security.yml` boots the real API against Postgres, seeds it, and runs an **OWASP ZAP baseline scan**, publishing SARIF to the Security tab plus a report artefact. On pull requests it also runs GitHub's dependency review as a *report* — see below for why it does not block.
 
-`release.yml` builds and pushes the container image to GHCR and queues EAS builds on a tag push.
+`release.yml` builds and pushes the container image to GHCR on a tag push, and queues EAS mobile builds — the latter only when the **`EAS_ENABLED` repository variable** is `true`, reading the token from the `EXPO_TOKEN` secret. It has to be a variable rather than a secret test because `secrets` is not a valid context in a job-level `if:`; without that gate a fork with no Expo account gets a skipped job and a green release run instead of a failure.
 
 ### Supply chain
 
@@ -438,19 +438,19 @@ rather than silently succeeding.
 
 ## Testing
 
-**666 tests**, and all three packages — `shared`, `api` and `mobile` — typecheck with **zero errors** under `strict` + `noUncheckedIndexedAccess`.
+**679 tests**, and all three packages — `shared`, `api` and `mobile` — typecheck with **zero errors** under `strict` + `noUncheckedIndexedAccess`.
 
 ```bash
 npm test                                    # everything, via turbo
 npm run typecheck                           # shared + api + mobile
 
 cd packages/shared && npx vitest run        #  69 contract tests
-cd packages/api    && npx vitest run        # 362 unit tests
+cd packages/api    && npx vitest run        # 375 unit tests
 cd packages/api    && npm run test:e2e      # 148 integration tests (needs Postgres)
 cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobile tests
 ```
 
-518 run anywhere. The **148 integration tests** boot the real Fastify app and drive it with `app.inject()`, so they need PostgreSQL — `npm run db:up` locally, or let CI's service containers provide it. When no database is reachable they **skip loudly** rather than passing vacuously, because a green run that exercised nothing would be believed.
+531 run anywhere. The **148 integration tests** boot the real Fastify app and drive it with `app.inject()`, so they need PostgreSQL — `npm run db:up` locally, or let CI's service containers provide it. When no database is reachable they **skip loudly** rather than passing vacuously, because a green run that exercised nothing would be believed.
 
 
 | Suite | Cases | Covers |
@@ -462,6 +462,7 @@ cd apps/mobile     && npx vitest run --config vitest.pure.config.ts   #  87 mobi
 | `nutrition` | 40 | Mifflin–St Jeor targets, goal ordering, macro splits, clinical clamping, macro verification |
 | `pagination` | 40 | Page clamping, offsets, cursors, ETags, field selection |
 | `openapi` | 6 | **The generated spec actually describes the API:** >80 paths, every resource tag represented, the endpoints a client integrates against first, bearer auth, the `{ data, meta }` envelope, and `/docs/json` serving the same document |
+| `ratelimit` | 13 | **The allow-list composition.** `RATE_LIMIT_DISABLED` genuinely allows everything, the health probes / Stripe webhook / docs stay exempt when it does not, `/metrics` deliberately does not, query strings are ignored, `/api/v1/health` is not mistaken for `/health`, and `generalRateLimitOptions()` no longer sets an allow-list at all so nothing can be silently overwritten |
 | `image` | 18 | **Upload admission.** Magic bytes decide, never the `Content-Type` header: forged `image/jpeg` over arbitrary bytes is refused, a GIF wearing a JPEG label is refused by its own header, allowed formats pass, and empty/oversized get 400/413. Plus a real libvips round-trip so a `sharp` upgrade fails here rather than in production |
 | `cost` | 24 | Model pricing resolution including dated suffixes, per-call cost, token estimation |
 | `format` + `parse` | 61 | Every user-facing number: money, weight, CO₂, dates, quantities |
@@ -494,11 +495,13 @@ Running the suite against a real PostgreSQL 18 server, and typechecking the **mo
 
 > **A forged `Content-Type` admitted arbitrary bytes.** `validateImageInput` fell back to the *declared* MIME type whenever magic-byte sniffing found nothing, so shell-script bytes labelled `image/jpeg` passed the allow-list and were forwarded to a vision provider and written to storage. The mismatch branch beneath it even logged "using sniffed type" while continuing to use the declared one. Sniffing is now a requirement, not a cross-check, and 18 tests pin upload admission.
 
+> **`RATE_LIMIT_DISABLED=true` logged "rate limiting is OFF" and then limited anyway.** `generalRateLimitOptions()` installed `allowList: () => true` for the flag, and the plugin spread its *own* allow-list after it — object spread decides the winner, so the operational list silently replaced the disable. Nothing noticed locally, where each run is short; in CI, where Redis makes the counter shared and persistent across the whole suite, the pantry-quota seed (which deliberately writes past the free-tier cap) tripped the 100/min general limit and failed with a 429 in a job configured to have no rate limiting at all. The allow-list is now composed in exactly one place, and proven both ways: 150 requests against a disabled server produce **zero** 429s, and 150 against an armed one produce **50**, with correct `x-ratelimit-*` headers. The armed half is what makes the first result mean anything.
+
 > **Every decimal silently became a string.** Upgrading `drizzle-orm` to 0.45 (for the SQL-injection advisory) changed `PgNumeric.mapFromDriverValue` to coerce NUMERIC to a string, overriding the global `pg` type parser the schema had been relying on. Nothing threw: `existing.quantity + input.quantity` became concatenation, the merged grocery line turned into `NaN`, and the API told the shopper to buy **0 g of flour**. All 41 decimal columns now declare `mode: 'number'` — the supported mechanism — and an integration test asserts NUMERIC arrives as a JS number across quantities, prices and savings.
 
 > **`/docs` documented three endpoints.** `@fastify/swagger` assembles the spec from an `onRoute` hook, so it only sees routes registered *after* it — and the docs plugin was registered last, on the reasonable-sounding theory that the route schemas had to exist first. The document came out with its own `openapi.json` route, the upload wildcard and the service banner, and none of the ~90 real endpoints. Swagger UI still rendered and looked complete, and the integration harness boots with `skipDocs: true`, so nothing complained. The spec is now 98 paths / 110 operations across all 13 tags, with a test that builds the app the way `server.ts` does and counts them.
 
-Two CI jobs were also broken in a way that made them look like real failures: `npx vitest run --config packages/api/vitest.config.ts --root packages/api` never started, because vitest resolves `--config` *relative to* `--root` and looked for `packages/api/packages/api/vitest.config.ts` — so the unit and integration jobs died at startup without running a single test. And the ZAP job polled `localhost:4000` while `PORT` defaults to **8080**, so the server booted fine and the scan reported it as broken.
+Three CI jobs were also broken in ways that made them look like real failures: `npx vitest run --config packages/api/vitest.config.ts --root packages/api` never started, because vitest resolves `--config` *relative to* `--root` and looked for `packages/api/packages/api/vitest.config.ts` — so the unit and integration jobs died at startup without running a single test. The ZAP job polled `localhost:4000` while `PORT` defaults to **8080**, so the server booted fine and the scan reported it as broken. And the unit job ran vitest with `--coverage` while `@vitest/coverage-v8` was not a dependency of anything, so it failed before the first test.
 
 Also caught: five list endpoints (`/meal-plans`, `/grocery-lists`, `/recipes/favorites`, `/recipes/history`, `/recipes`) each inventing their own pagination shape; `WeekOverviewDto` never exposing `grocery_list_id`, so the Plan screen's "open your shopping list" shortcut had nothing to open; `GET /meal-plans/:id/days` returning `date: null` and no day label, leaving the calendar cards with empty headers and no "today" highlight; per-achievement `points` computed server-side but never sent, so the "+N pts" badge could not render; a non-multipart upload to `/scan/fridge` returning **500** instead of 415; `waste/stats` breaking its own `YYYY-MM-DD` contract by returning full timestamps; two Ionicons glyph names that do not exist (`ice-cube-outline`, `filing-outline`), rendering blank icons on the freezer and pantry rows; `StatCard` imported from a path it does not live at, in four screens; and four DTO fields (`cooking_skill_level`, `dietary_preference`, `health_goal`, `activity_level`, `added_via`) typed as loose `string` while the database columns are real enums — which is what made the preferences bug invisible to the compiler.
 

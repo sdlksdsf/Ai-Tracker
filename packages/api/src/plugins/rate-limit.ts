@@ -1,7 +1,7 @@
 import fp from 'fastify-plugin';
 import rateLimit from '@fastify/rate-limit';
 import type { FastifyInstance } from 'fastify';
-import { generalRateLimitOptions } from '../lib/ratelimit.js';
+import { generalRateLimitOptions, resolveAllowList } from '../lib/ratelimit.js';
 import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 
@@ -21,19 +21,18 @@ async function rateLimitPlugin(app: FastifyInstance): Promise<void> {
     logger.warn('RATE_LIMIT_DISABLED=true — rate limiting is OFF. Never set this in production.');
   }
 
+  // Built once, outside the request path.
+  const allowList = resolveAllowList();
+
   await app.register(rateLimit, {
     ...generalRateLimitOptions(),
     // A Redis hiccup must not take the whole API down.
     skipOnError: true,
     hook: 'onRequest',
-    allowList: (request) => {
-      const url = request.url.split('?')[0] ?? '';
-      if (url === '/health' || url === '/health/live' || url === '/health/ready') return true;
-      if (url === '/metrics') return false;
-      if (url.endsWith('/subscription/webhook')) return true;
-      if (url.startsWith('/docs')) return true;
-      return false;
-    },
+    // The single place the allow-list is set. It used to be assigned here *and*
+    // inside generalRateLimitOptions(), and this spread won — which is why
+    // RATE_LIMIT_DISABLED logged a warning and then limited anyway.
+    allowList: (request) => allowList(request.url),
     onExceeding: (request, key) => {
       request.log.debug({ key, url: request.url }, 'Rate limit approaching');
     },

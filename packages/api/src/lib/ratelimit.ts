@@ -73,6 +73,38 @@ export function rateLimitErrorFormatter(
 }
 
 /** Global limiter — 100/min, applied to every route unless overridden. */
+/**
+ * Paths that must never be throttled, whatever the global setting.
+ *
+ * A liveness probe that gets a 429 takes a healthy container out of rotation,
+ * and a rejected Stripe webhook silently desyncs billing. `/metrics` is
+ * explicitly *not* exempt: it is cheap to serve but worth throttling.
+ */
+export function isOperationallyExempt(url: string): boolean {
+  const path = url.split('?')[0] ?? '';
+  if (path === '/health' || path === '/health/live' || path === '/health/ready') return true;
+  if (path === '/metrics') return false;
+  if (path.endsWith('/subscription/webhook')) return true;
+  if (path.startsWith('/docs')) return true;
+  return false;
+}
+
+/**
+ * The allow-list the limiter actually runs with.
+ *
+ * Takes the flag as a parameter so it can be tested without re-importing the
+ * memoised `env`, and *composes* the two exemptions rather than choosing between
+ * them. The plugin used to spread its own allow-list after
+ * `generalRateLimitOptions()`, which replaced the `() => true` that
+ * `RATE_LIMIT_DISABLED` installs — so the flag logged "rate limiting is OFF.
+ * Never set this in production." and then limited at full strength anyway. That
+ * is how a test-only flag ended up 429ing the integration suite's pantry-quota
+ * seed once Redis made the counter shared and persistent across the run.
+ */
+export function resolveAllowList(disabled: boolean = env.RATE_LIMIT_DISABLED): (url: string) => boolean {
+  return (url: string) => disabled || isOperationallyExempt(url);
+}
+
 export function generalRateLimitOptions(): RateLimitPluginOptions {
   const store = safeStore();
   return {
@@ -80,7 +112,9 @@ export function generalRateLimitOptions(): RateLimitPluginOptions {
     max: env.RATE_LIMIT_GENERAL_MAX,
     timeWindow: '1 minute',
     keyGenerator: rateLimitKeyGenerator,
-    allowList: env.RATE_LIMIT_DISABLED ? () => true : undefined,
+    // Deliberately not set here. The allow-list is composed once by
+    // `resolveAllowList()` and passed by the plugin — having two places assign
+    // the same option is what let a spread silently discard RATE_LIMIT_DISABLED.
     redis: store ?? undefined,
     errorResponseBuilder: rateLimitErrorFormatter,
     addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
