@@ -52,13 +52,28 @@ if (schemaArg > -1) {
     console.warn(`  ! could not download Render's schema (${err.message}) — schema check skipped`);
   }
 }
+// In GitHub Actions, say visibly whether the schema check really ran.
+const annotate = (level, message) => {
+  if (process.env.GITHUB_ACTIONS === 'true') console.log(`::${level} title=render.yaml::${message}`);
+};
 if (schema) {
   const ajv = new Ajv2020({ strict: false, allErrors: true, logger: false });
   const validate = ajv.compile(schema);
+  const valid = validate(blueprint);
   check(
-    validate(blueprint),
+    valid,
     "matches Render's Blueprint schema",
     JSON.stringify((validate.errors ?? []).filter((e) => !e.schemaPath.includes('anyOf')).slice(0, 5)),
+  );
+  if (valid)
+    annotate(
+      'notice',
+      `Validated against Render's Blueprint schema (${schemaArg > -1 ? 'local copy' : 'downloaded from render.com'})`,
+    );
+} else {
+  annotate(
+    'warning',
+    "Render's schema could not be downloaded — render.yaml was NOT schema-validated in this run",
   );
 }
 
