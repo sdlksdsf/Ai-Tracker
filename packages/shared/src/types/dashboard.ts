@@ -225,7 +225,7 @@ export interface WasteImpactDto {
   equivalent_meals: number;
   /** UNEP Food Waste Index household average, kg per person per week. */
   national_average_kg_per_week: number;
-  /** This user's weekly average since joining. */
+  /** This user's weekly average over the last four weeks (or since joining, if newer). */
   user_kg_per_week: number;
   /** True when the user wastes less than the average household. */
   better_than_average: boolean;

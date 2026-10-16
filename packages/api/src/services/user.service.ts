@@ -218,7 +218,15 @@ export async function touchLastActive(userId: string): Promise<void> {
   await db.update(users).set({ lastActiveAt: new Date() }).where(eq(users.id, userId)).catch(() => undefined);
 }
 
-/** Soft-delete the account and cascade its data (GDPR "delete my data"). */
+/**
+ * Delete the account and cascade its data (GDPR "delete my data").
+ *
+ * This is a hard delete: every table that references `users` declares
+ * `ON DELETE CASCADE` (recipes keep their rows with `owner_id` set to null and
+ * `ai_usage_logs` keeps its cost audit trail with a null user), so a single
+ * statement removes the user's data and nothing else. The route description
+ * used to claim a soft delete, which no code ever performed.
+ */
 export async function deleteAccount(userId: string): Promise<void> {
   const db = getDb();
   const rows = await db.delete(users).where(eq(users.id, userId)).returning({ id: users.id });
@@ -233,8 +241,22 @@ export async function getUsersByIds(ids: string[]): Promise<User[]> {
   return db.select().from(users).where(inArray(users.id, ids));
 }
 
-async function invalidateUserCache(userId: string): Promise<void> {
-  await Promise.all([cache.del(CacheKeys.pantry(userId)), cache.del(CacheKeys.session(userId))]);
+/**
+ * Drop every cached view of this user.
+ *
+ * `userProfile` is the one that matters: `plugins/auth.ts` caches the whole
+ * users row under it for 60 seconds and `requirePlan` reads the tier from that
+ * row, while `withUser` hands it to route handlers as `request.fullUser`. It
+ * was never invalidated, so a profile edit (or a plan change) could be ignored
+ * for a minute by every route that reads `fullUser` — and a freshly upgraded
+ * user could still be refused a premium feature.
+ */
+export async function invalidateUserCache(userId: string): Promise<void> {
+  await Promise.all([
+    cache.del(CacheKeys.userProfile(userId)),
+    cache.del(CacheKeys.pantry(userId)),
+    cache.del(CacheKeys.session(userId)),
+  ]);
 }
 
 function toDateString(value: Date | string): string {

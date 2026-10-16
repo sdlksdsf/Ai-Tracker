@@ -3,10 +3,12 @@ import { logger } from './lib/logger.js';
 import { getDb, closeDatabase, checkDatabase } from './db/index.js';
 import { runMigrations, ensureExtensions } from './db/migrate.js';
 import { closeCache } from './lib/redis.js';
-import { closeQueues } from './lib/queue.js';
+import { closeQueues, isRedisBacked } from './lib/queue.js';
 import { flushTelemetry } from './plugins/telemetry.js';
 import { startApp } from './app.js';
 import { seedDemoData } from './db/seed.js';
+import { registerWorkers } from './jobs/workers.js';
+import { startCrons, stopCrons } from './jobs/crons.js';
 
 /**
  * HTTP server entrypoint.
@@ -61,10 +63,35 @@ async function main(): Promise<void> {
     });
   }
 
-  // ---- 3. HTTP server ----------------------------------------------------
+  // ---- 3. Job processors -------------------------------------------------
+  // Something must consume the queues this process feeds. A separate worker
+  // process does it in production (`ENABLE_WORKER=true`, the default), and two
+  // deployments expect the API itself to do it:
+  //
+  //   * no Redis — `getQueue()` hands back the in-process implementation, whose
+  //     processor has to be attached here or jobs (fridge scans!) are accepted
+  //     and never run;
+  //   * `ENABLE_WORKER=false` — the documented single-process deployment, which
+  //     otherwise processes nothing and schedules no notification sweeps.
+  //
+  // Attaching the same processors in an API replica that also runs a worker
+  // would be harmless (BullMQ load-balances), but the schedules would be
+  // registered twice, so it is decided by configuration instead.
+  const ownsJobs = !isRedisBacked() || !env.ENABLE_WORKER;
+
+  if (ownsJobs) {
+    registerWorkers();
+    await startCrons();
+    logger.info(
+      { redis: isRedisBacked(), reason: isRedisBacked() ? 'ENABLE_WORKER=false' : 'in-process queue' },
+      'API process registered job processors',
+    );
+  }
+
+  // ---- 4. HTTP server ----------------------------------------------------
   const app = await startApp();
 
-  // ---- 4. Graceful shutdown ---------------------------------------------
+  // ---- 5. Graceful shutdown ---------------------------------------------
   let shuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -80,6 +107,7 @@ async function main(): Promise<void> {
     timer.unref();
 
     try {
+      stopCrons();
       await app.close();
       await closeQueues();
       await closeCache();

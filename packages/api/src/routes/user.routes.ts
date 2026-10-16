@@ -260,8 +260,10 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       tags: ['users'],
       summary: 'Delete the account and every row that belongs to it',
       description:
-        'Soft-deletes the user (so aggregate stats stay honest) and cascades pantry, scans, plans, ' +
-        'lists, waste logs, ratings and favourites. All sessions are revoked immediately.',
+        'Deletes the user row and, through ON DELETE CASCADE, every row that references it: pantry, ' +
+        'scans, plans, lists, waste logs, ratings, favourites and sessions. Recipes they authored are ' +
+        'kept with their owner detached, and historic AI usage rows are anonymised rather than ' +
+        'deleted. All sessions are revoked immediately.',
     },
   }, async (request, reply) => {
     const userId = request.user!.id;

@@ -9,10 +9,11 @@ import type {
 import { PLAN_LIMITS, DEEP_LINK_ROUTES } from '@platematch/shared';
 import Stripe from 'stripe';
 import { getDb } from '../db/index.js';
-import { fridgeScans, mealPlans, pantryItems, users, type User } from '../db/schema.js';
+import { mealPlans, pantryItems, users, type User } from '../db/schema.js';
 import { env, hasStripeKeys } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { NotFoundError } from '../lib/errors.js';
+import { CacheKeys, cache } from '../lib/redis.js';
 import { isoWeekKey, monthKey } from '../utils/dates.js';
 import { getUsage } from './ai/ledger.js';
 
@@ -43,6 +44,15 @@ export function getStripe(): Stripe | null {
   return stripeClient;
 }
 
+/**
+ * The auth plugin caches the users row (tier included) for 60 seconds and
+ * `requirePlan` trusts it, so every tier change has to drop it — otherwise a
+ * user who just paid keeps getting "Upgrade to unlock this" for a minute.
+ */
+async function invalidateSubscriptionCache(userId: string): Promise<void> {
+  await Promise.all([cache.del(CacheKeys.userProfile(userId)), cache.del(CacheKeys.session(userId))]);
+}
+
 export function getPlanLimits(tier: string): PlanLimits {
   return PLAN_LIMITS[(tier as keyof typeof PLAN_LIMITS) ?? 'free'] ?? PLAN_LIMITS.free;
 }
@@ -71,6 +81,7 @@ export async function getSubscriptionStatus(userId: string): Promise<Subscriptio
       .update(users)
       .set({ subscriptionTier: 'free', subscriptionStatus: 'expired', updatedAt: new Date() })
       .where(eq(users.id, userId));
+    await invalidateSubscriptionCache(userId);
   }
 
   const limits = getPlanLimits(tier);
@@ -180,6 +191,7 @@ export async function createCheckoutSession(userId: string, input: CheckoutInput
       })
       .where(eq(users.id, userId));
 
+    await invalidateSubscriptionCache(userId);
     return { checkout_url: null, session_id: null, simulated: true };
   }
 
@@ -253,6 +265,7 @@ export async function cancelSubscription(userId: string, immediate = false): Pro
       .update(users)
       .set({ subscriptionTier: 'free', subscriptionStatus: 'canceled', subscriptionExpiresAt: null, cancelAtPeriodEnd: false, updatedAt: new Date() })
       .where(eq(users.id, userId));
+    await invalidateSubscriptionCache(userId);
     return { canceled: true, expires_at: null };
   }
 
@@ -311,6 +324,7 @@ export async function handleWebhook(rawBody: Buffer, signature: string): Promise
         })
         .where(eq(users.id, userId));
 
+      await invalidateSubscriptionCache(userId);
       return { handled: true, type: event.type, userId };
     }
 
@@ -336,6 +350,7 @@ export async function handleWebhook(rawBody: Buffer, signature: string): Promise
         })
         .where(eq(users.id, userId));
 
+      await invalidateSubscriptionCache(userId);
       return { handled: true, type: event.type, userId };
     }
 
@@ -349,6 +364,7 @@ export async function handleWebhook(rawBody: Buffer, signature: string): Promise
         .set({ subscriptionTier: 'free', subscriptionStatus: 'canceled', cancelAtPeriodEnd: false, updatedAt: new Date() })
         .where(eq(users.id, userId));
 
+      await invalidateSubscriptionCache(userId);
       return { handled: true, type: event.type, userId };
     }
 
@@ -358,6 +374,7 @@ export async function handleWebhook(rawBody: Buffer, signature: string): Promise
       if (!userId) return { handled: false, type: event.type };
 
       await db.update(users).set({ subscriptionStatus: 'past_due', updatedAt: new Date() }).where(eq(users.id, userId));
+      await invalidateSubscriptionCache(userId);
       return { handled: true, type: event.type, userId };
     }
 
@@ -402,6 +419,7 @@ export async function restorePurchases(userId: string): Promise<SubscriptionStat
           updatedAt: new Date(),
         })
         .where(eq(users.id, userId));
+      await invalidateSubscriptionCache(userId);
     }
   }
 

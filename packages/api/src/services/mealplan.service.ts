@@ -28,8 +28,8 @@ import {
 } from '../db/schema.js';
 import { NotFoundError, QuotaExceededError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { CacheKeys, cache } from '../lib/redis.js';
-import { estimatePriceUsd, normalizeIngredient, round1, round2, similarity } from '../utils/food.js';
+import { CacheKeys, cache, invalidateDashboardCaches } from '../lib/redis.js';
+import { coerceCategory, estimatePriceUsd, normalizeIngredient, round1, round2, similarity } from '../utils/food.js';
 import {
   addDays,
   dateForDayOfWeek,
@@ -659,6 +659,7 @@ async function assertPlanOwner(userId: string, planId: string): Promise<MealPlan
 }
 
 async function invalidatePlan(planId: string, userId: string): Promise<void> {
+  await invalidateDashboardCaches(userId);
   await cache.del(CacheKeys.mealPlan(planId));
   await cache.delPattern(CacheKeys.weekOverview(userId, '*'));
 }
@@ -966,7 +967,11 @@ export async function buildGroceryListFromPlan(
           groceryListId: listId!,
           ingredientName: item.name.slice(0, 100),
           normalizedKey: item.key,
-          category: item.category as GroceryList['status'] as never,
+          // Coerced onto the stored enum. The old double cast through
+          // `GroceryList['status']` (… as never) switched type checking off for
+          // this column entirely, so a free-form category the enum did not know
+          // would have reached Postgres and failed the insert.
+          category: coerceCategory(item.category),
           quantity: item.quantity,
           unit: item.unit,
           estimatedCost: item.estimatedCost,
@@ -1090,7 +1095,12 @@ export async function getNutritionBreakdown(userId: string, planId: string): Pro
 /** Convenience for the "what's for dinner" quick links. */
 export async function getActivePlan(userId: string): Promise<MealPlanDto | null> {
   const db = getDb();
-  const today = toIsoDate(todayInTimezone('UTC'));
+
+  // "Today" is the plan owner's today. Using UTC here dropped the plan that
+  // covers the user's current day for anyone whose local date had already
+  // rolled over — a Karachi user at 02:00 Monday saw last week's plan.
+  const [owner] = await db.select({ timezone: users.timezone }).from(users).where(eq(users.id, userId)).limit(1);
+  const today = todayInTimezone(owner?.timezone ?? 'UTC');
   const [row] = await db
     .select()
     .from(mealPlans)

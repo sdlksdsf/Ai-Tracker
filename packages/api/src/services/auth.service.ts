@@ -317,8 +317,13 @@ export async function oauthGoogle(input: OAuthGoogleInput): Promise<AuthSession>
 
 export async function oauthApple(input: OAuthAppleInput): Promise<AuthSession> {
   const profile = await verifyAppleIdentityToken(input.identity_token);
-  // Apple may hide the email; fall back to the client-supplied one.
-  if (!profile.email && input.email) profile.email = input.email.toLowerCase();
+  // Apple hides the email on every sign-in after the first; fall back to the
+  // client-supplied one — but that address is unverified, so it may never be
+  // used to link this provider to an existing account (see `oauthSignInOrCreate`).
+  if (!profile.email && input.email) {
+    profile.email = input.email.toLowerCase();
+    profile.emailVerified = false;
+  }
   if (!profile.fullName && input.full_name) profile.fullName = input.full_name;
   if (!profile.email) throw new UnauthorizedError('Apple did not provide an email address');
   return oauthSignInOrCreate(profile, input.fcm_token);
@@ -342,8 +347,22 @@ async function oauthSignInOrCreate(profile: OAuthProfile, fcmToken?: string): Pr
     return buildSession(user);
   }
 
-  // 2. Email already registered with a password? Link the provider to it.
+  // 2. Email already registered with a password? Link the provider to it — but
+  // only when the provider *vouches* for the address. An unverified Google
+  // email (or the client-supplied email on an Apple token) proves nothing about
+  // ownership, and linking on it would hand the account to whoever presents
+  // that address.
   const byEmail = await db.select().from(users).where(eq(users.email, profile.email)).limit(1);
+  if (byEmail[0] && !profile.emailVerified) {
+    logger.warn(
+      { provider: profile.provider, email: profile.email },
+      'Refused to link an unverified OAuth email to an existing account',
+    );
+    throw new UnauthorizedError(
+      'That email is already registered. Sign in with your password, then connect this provider from settings.',
+    );
+  }
+
   if (byEmail[0]) {
     const user = byEmail[0] as User;
     await db.insert(oauthAccounts).values({
@@ -352,6 +371,8 @@ async function oauthSignInOrCreate(profile: OAuthProfile, fcmToken?: string): Pr
       providerAccountId: profile.providerAccountId,
       email: profile.email,
     });
+    // Reaching here means the provider asserted the address, so marking it
+    // verified is warranted.
     const patch: Partial<User> = { lastActiveAt: new Date(), emailVerified: true };
     if (!user.avatarUrl && profile.avatarUrl) patch.avatarUrl = profile.avatarUrl;
     await db.update(users).set(patch).where(eq(users.id, user.id));

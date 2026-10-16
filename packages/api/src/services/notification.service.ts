@@ -22,7 +22,15 @@ import {
 import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { fetchJson } from './ai/http.js';
-import { daysUntilExpiry, expiryLabel, greetingForHour, hourInTimezone, todayInTimezone } from '../utils/dates.js';
+import {
+  daysUntilExpiry,
+  expiryLabel,
+  greetingForHour,
+  hourInTimezone,
+  isoDayOfWeek,
+  minuteOfHourInTimezone,
+  todayInTimezone,
+} from '../utils/dates.js';
 import { normalizeIngredient, round2 } from '../utils/food.js';
 
 /**
@@ -317,14 +325,32 @@ export async function updatePreferences(userId: string, input: NotificationPrefe
   return row as NotificationPreference;
 }
 
-/** True when a push would land inside the user's quiet hours. */
+/**
+ * True when a push would land inside the user's quiet hours.
+ *
+ * Compared at minute precision: the settings screen offers "22:30", and a
+ * window that starts then must not silence a 22:15 reminder. (The previous
+ * hour-granularity comparison treated the whole of 22:00 as quiet, and equally
+ * kept a 07:30 window quiet until 08:00.)
+ */
 export function isQuietHour(prefs: NotificationPreference, timezone: string, now = new Date()): boolean {
   if (!prefs.quietHoursStart || !prefs.quietHoursEnd) return false;
-  const hour = hourInTimezone(timezone, now);
-  const [startH] = prefs.quietHoursStart.split(':').map(Number);
-  const [endH] = prefs.quietHoursEnd.split(':').map(Number);
-  if (startH == null || endH == null) return false;
-  return startH <= endH ? hour >= startH && hour < endH : hour >= startH || hour < endH;
+  const start = minutesOfDay(prefs.quietHoursStart);
+  const end = minutesOfDay(prefs.quietHoursEnd);
+  if (start === null || end === null) return false;
+  // A zero-length window means "no quiet hours", not "always quiet".
+  if (start === end) return false;
+
+  const current = hourInTimezone(timezone, now) * 60 + minuteOfHourInTimezone(timezone, now);
+  return start < end ? current >= start && current < end : current >= start || current < end;
+}
+
+/** "HH:MM" → minutes since local midnight, or null when unparseable. */
+function minutesOfDay(value: string): number | null {
+  const [hour, minute] = value.split(':').map(Number);
+  if (hour == null || !Number.isFinite(hour) || !Number.isFinite(minute ?? 0)) return null;
+  if (hour < 0 || hour > 23) return null;
+  return hour * 60 + (minute ?? 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +468,7 @@ export async function sendMealReminder(userId: string, mealType: 'breakfast' | '
   if (isQuietHour(prefs, timezone)) return false;
 
   const today = todayInTimezone(timezone);
+  const todayDayOfWeek = isoDayOfWeek(today);
 
   const entry = await db
     .select({
@@ -462,6 +489,14 @@ export async function sendMealReminder(userId: string, mealType: 'breakfast' | '
         eq(mealPlans.status, 'active'),
         sql`${mealPlans.weekStartDate} <= ${today}`,
         sql`${mealPlans.weekEndDate} >= ${today}`,
+        // The plan's entry for *today* — not merely the first uncooked one.
+        //
+        // Without this the push said "Today's pick: …" and named whichever
+        // dinner happened to come back first, which is Monday's dinner for a
+        // user being reminded on Thursday. Entries carry a date for generated
+        // plans and a day-of-week for plan rows written without one, so both
+        // are accepted.
+        sql`(${mealPlanEntries.date} = ${today} OR (${mealPlanEntries.date} IS NULL AND ${mealPlanEntries.dayOfWeek} = ${todayDayOfWeek}))`,
       ),
     )
     .limit(1);

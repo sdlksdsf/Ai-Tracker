@@ -36,8 +36,36 @@ export interface NutritionEnrichPayload {
   limit?: number;
 }
 
+/**
+ * Every task the maintenance queue can run.
+ *
+ * One list, used by three places that must never disagree:
+ *   • `crons.ts` — which task each schedule enqueues
+ *   • `handleMaintenanceJob` — the dispatcher below
+ *   • the unit test that asserts the two sets are identical
+ *
+ * They used to disagree: the BullMQ scheduler hard-coded `{ task: 'refresh-expiry' }`
+ * for every cron, so with Redis configured the four notification sweeps never
+ * ran at all and purge-tokens / purge-scans / recalculate-achievements never
+ * ran either — while `refresh-expiry` ran five times a day. Only the
+ * in-process fallback (no Redis) executed the right jobs, which is exactly the
+ * configuration local development uses, so nothing looked broken.
+ */
+export const MAINTENANCE_TASKS = [
+  'refresh-expiry',
+  'purge-tokens',
+  'purge-scans',
+  'recalculate-achievements',
+  'expiry-alerts',
+  'meal-reminders',
+  'smart-suggestions',
+  'weekly-report',
+] as const;
+
+export type MaintenanceTask = (typeof MAINTENANCE_TASKS)[number];
+
 export interface MaintenancePayload {
-  task: 'refresh-expiry' | 'purge-tokens' | 'purge-scans' | 'recalculate-achievements';
+  task: MaintenanceTask;
 }
 
 /** Run the vision pipeline for a queued scan, then push the result. */
@@ -203,10 +231,18 @@ export async function handleNutritionJob(job: Job<NutritionEnrichPayload>): Prom
   logger.info({ candidates: rows.length, written }, 'Nutrition backfill finished');
 }
 
-/** Nightly housekeeping — see `crons.ts` for the schedule. */
-export async function handleMaintenanceJob(job: Job<MaintenancePayload>): Promise<void> {
-  const { task } = job.data;
+/** How long scan history is kept before the `purge-scans` task drops it. */
+export const SCAN_RETENTION_DAYS = 90;
 
+/**
+ * Run one scheduled task.
+ *
+ * This is the single implementation, called by `handleMaintenanceJob` (BullMQ
+ * worker, and the in-process queue's processor) and directly by `crons.ts` when
+ * there is no queue backend. Before it existed, the scheduler and the worker
+ * each had their own idea of what a cron should run, and they drifted.
+ */
+export async function runMaintenanceTask(task: MaintenanceTask): Promise<void> {
   switch (task) {
     case 'refresh-expiry': {
       const { refreshExpiredFlags } = await import('../services/pantry.service.js');
@@ -227,7 +263,7 @@ export async function handleMaintenanceJob(job: Job<MaintenancePayload>): Promis
       const { fridgeScans } = await import('../db/schema.js');
       const { lt } = await import('drizzle-orm');
 
-      const cutoff = new Date(Date.now() - 90 * 86_400_000);
+      const cutoff = new Date(Date.now() - SCAN_RETENTION_DAYS * 86_400_000);
       const removed = await getDb()
         .delete(fridgeScans)
         .where(lt(fridgeScans.createdAt, cutoff))
@@ -256,10 +292,35 @@ export async function handleMaintenanceJob(job: Job<MaintenancePayload>): Promis
       logger.info({ users: rows.length }, 'Achievements recalculated');
       return;
     }
+    case 'expiry-alerts': {
+      const { sendExpiryAlertsSweep } = await import('./expiry-notifications.js');
+      logger.info(await sendExpiryAlertsSweep(), 'Expiry alert sweep finished');
+      return;
+    }
+    case 'meal-reminders': {
+      const { sendMealRemindersSweep } = await import('./meal-reminders.js');
+      logger.info(await sendMealRemindersSweep(), 'Meal reminder sweep finished');
+      return;
+    }
+    case 'smart-suggestions': {
+      const { sendSmartSuggestionsSweep } = await import('./smart-suggestions.js');
+      logger.info(await sendSmartSuggestionsSweep(), 'Smart suggestion sweep finished');
+      return;
+    }
+    case 'weekly-report': {
+      const { sendWeeklyReportsSweep } = await import('./weekly-report.js');
+      logger.info(await sendWeeklyReportsSweep(), 'Weekly report sweep finished');
+      return;
+    }
     default: {
       logger.warn({ task }, 'Unknown maintenance task');
     }
   }
+}
+
+/** Queue/worker entrypoint — see `crons.ts` for the schedule. */
+export async function handleMaintenanceJob(job: Job<MaintenancePayload>): Promise<void> {
+  await runMaintenanceTask(job.data.task);
 }
 
 /** Wire every processor to its queue. Returns the BullMQ workers (if any). */

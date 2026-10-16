@@ -25,8 +25,48 @@ type MealType = 'breakfast' | 'lunch' | 'dinner';
 
 const MEALS: MealType[] = ['breakfast', 'lunch', 'dinner'];
 
-/** How many minutes past the configured hour we still consider "on time". */
-const GRACE_MINUTES = 55;
+/**
+ * How late a reminder may still be delivered.
+ *
+ * The sweep runs hourly (BullMQ cron `0 * * * *`; the in-process fallback fires
+ * one interval after boot, at whatever minute that is), so the first sweep at or
+ * after a configured time can be up to 59 minutes later. 60 covers the whole
+ * cycle: a time of 18:30 is delivered by the 19:00 sweep.
+ *
+ * The previous implementation compared `localHour === hour` and then skipped
+ * when `localMinute < minute`, which meant a reminder configured at *any*
+ * non-zero minute — including both shipping defaults, 07:30 breakfast and 18:30
+ * dinner — could never fire: the only sweep in its hour is the one at :00, and
+ * the next sweep is in the next hour.
+ */
+export const GRACE_MINUTES = 60;
+
+const MINUTES_PER_DAY = 24 * 60;
+
+/**
+ * Is a reminder configured for `configured` ("HH:MM", the user's local clock)
+ * due at local time `localHour:localMinute`?
+ *
+ * True when local time has reached the configured minute-of-day and is no more
+ * than `graceMinutes` past it, wrapping across midnight so a 23:30 reminder is
+ * delivered by the 00:00 sweep instead of being skipped until the next day.
+ */
+export function isReminderDue(
+  configured: string,
+  localHour: number,
+  localMinute: number,
+  graceMinutes: number = GRACE_MINUTES,
+): boolean {
+  const [hour, minute] = parseClock(configured);
+  const target = hour * 60 + minute;
+  const now = localHour * 60 + localMinute;
+  const elapsed = (now - target + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+  return elapsed <= graceMinutes;
+}
+
+function defaultHourFor(meal: MealType): string {
+  return meal === 'breakfast' ? '07:30' : meal === 'lunch' ? '12:00' : '18:30';
+}
 
 export async function sendMealRemindersSweep(now = new Date()): Promise<SweepResult> {
   const db = getDb();
@@ -89,13 +129,9 @@ export async function sendMealRemindersSweep(now = new Date()): Promise<SweepRes
 
     for (const meal of MEALS) {
       const configured = candidate[meal] ?? defaultHourFor(meal);
-      const [hour, minute] = parseClock(configured);
 
-      // Fire only inside the configured hour (plus grace), never twice.
-      const sameHour = localHour === hour;
-      const withinGrace = sameHour && localMinute <= GRACE_MINUTES;
-      if (!sameHour && !withinGrace) continue;
-      if (minute > 0 && localMinute < minute) continue;
+      // Fire on the first sweep at or after the configured time, never twice.
+      if (!isReminderDue(configured, localHour, localMinute)) continue;
 
       const marker = `${CacheKeys.mealReminder(candidate.userId)}:${localDay}:${meal}`;
       // eslint-disable-next-line no-await-in-loop
@@ -125,10 +161,6 @@ export async function sendMealRemindersSweep(now = new Date()): Promise<SweepRes
   }
 
   return result;
-}
-
-function defaultHourFor(meal: MealType): string {
-  return meal === 'breakfast' ? '07:30' : meal === 'lunch' ? '12:00' : '18:30';
 }
 
 /** Parse "HH:MM" defensively — a bad value falls back to the top of the hour. */

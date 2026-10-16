@@ -239,7 +239,14 @@ describe.skipIf(!available)('pantry', () => {
       expect(stats.total_items).toBeGreaterThan(0);
       expect(stats.expiring_soon).toBeGreaterThanOrEqual(0);
       expect(stats.expired).toBeGreaterThanOrEqual(0);
-      expect(stats.total_estimated_value).toBeGreaterThanOrEqual(0);
+      // Priced from the shared price index. The Pantry screen renders this as
+      // "Estimated value", and it used to be a hard-coded 0 — every user saw
+      // $0.00 no matter what was on their shelves.
+      expect(stats.total_estimated_value).toBeGreaterThan(0);
+      // The screen's "oldest item" line reads this; it was hard-coded null.
+      expect(stats.oldest_item).not.toBeNull();
+      expect(stats.oldest_item!.ingredient_name).toBeTruthy();
+      expect(stats.oldest_item!.days).toBeGreaterThanOrEqual(0);
       expect(Array.isArray(stats.by_category)).toBe(true);
       expect(Array.isArray(stats.by_location)).toBe(true);
     });

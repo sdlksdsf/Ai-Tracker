@@ -455,6 +455,10 @@ describe.skipIf(!available)('subscriptions', () => {
 
 describe.skipIf(!available)('dashboard', () => {
   let user: TestUser;
+  /** An `active` plan from three weeks ago — see the assertion on today's meals. */
+  let stalePlanId: string;
+  /** The plan that actually covers today. */
+  let currentPlanId: string;
 
   beforeAll(async () => {
     harness = await startHarness();
@@ -468,6 +472,67 @@ describe.skipIf(!available)('dashboard', () => {
     ]);
     await harness!.post('/api/v1/waste', { item_name: 'old bread', reason: 'expired', quantity: 300, unit: 'g' }, user.accessToken);
     await harness!.post('/api/v1/recipes/generate', { use_pantry: true, count: 3 }, user.accessToken);
+
+    // A finished week that was never archived: generating a new plan does not
+    // archive the previous one, so plans accumulate as `active`. Seeded through
+    // drizzle rather than the API because the free tier allows one plan a month.
+    const { getDb } = await import('../../src/db/index.js');
+    const { mealPlanEntries, mealPlans } = await import('../../src/db/schema.js');
+
+    const dayMs = 86_400_000;
+    const start = new Date(Date.now() - 21 * dayMs);
+    const iso = (value: Date) => value.toISOString().slice(0, 10);
+    // ISO weekday (1 = Monday … 7 = Sunday) for today.
+    const todayIsoDay = ((new Date().getUTCDay() + 6) % 7) + 1;
+
+    const [plan] = await getDb()
+      .insert(mealPlans)
+      .values({
+        userId: user.id,
+        name: 'Meal plan · stale week',
+        weekStartDate: iso(start),
+        weekEndDate: iso(new Date(start.getTime() + 6 * dayMs)),
+        status: 'active',
+      })
+      .returning();
+
+    stalePlanId = (plan as { id: string }).id;
+
+    await getDb().insert(mealPlanEntries).values({
+      mealPlanId: stalePlanId,
+      dayOfWeek: todayIsoDay,
+      date: iso(new Date(start.getTime() + (todayIsoDay - 1) * dayMs)),
+      mealType: 'dinner',
+      servings: 2,
+      calories: 640,
+    });
+
+    // The same weekday in the week that covers today: both plans are `active`
+    // and both claim today's weekday, which is what made "Today's meals"
+    // ambiguous.
+    const today = new Date();
+    const weekStart = new Date(today.getTime() - 2 * dayMs);
+    const [current] = await getDb()
+      .insert(mealPlans)
+      .values({
+        userId: user.id,
+        name: 'Meal plan · this week',
+        weekStartDate: iso(weekStart),
+        weekEndDate: iso(new Date(weekStart.getTime() + 6 * dayMs)),
+        status: 'active',
+      })
+      .returning();
+
+    currentPlanId = (current as { id: string }).id;
+
+    await getDb().insert(mealPlanEntries).values({
+      mealPlanId: currentPlanId,
+      dayOfWeek: todayIsoDay,
+      date: iso(today),
+      mealType: 'dinner',
+      servings: 2,
+      calories: 720,
+    });
   });
 
   afterAll(async () => {
@@ -487,7 +552,9 @@ describe.skipIf(!available)('dashboard', () => {
 
     expect(home.pantry_summary.total_items).toBe(4);
     expect(home.pantry_summary.expiring_soon_count).toBeGreaterThanOrEqual(2);
-    expect(home.pantry_summary.estimated_value).toBeGreaterThanOrEqual(0);
+    // Derived from the price index, not hard-coded: four priced ingredients are
+    // always worth something. (This field used to be a literal 0.)
+    expect(home.pantry_summary.estimated_value).toBeGreaterThan(0);
 
     expect(home.stats_snapshot.scans_completed).toBeGreaterThanOrEqual(0);
     expect(home.stats_snapshot.meals_cooked).toBeGreaterThanOrEqual(0);
@@ -497,6 +564,19 @@ describe.skipIf(!available)('dashboard', () => {
     expect(typeof home.money_saved_this_week).toBe('number');
     expect(typeof home.co2_saved_this_week).toBe('number');
     expect(typeof home.show_upgrade_prompt).toBe('boolean');
+  });
+
+  it('lists today\u2019s plan and ignores an active plan that does not cover today', async () => {
+    const home = data<HomeSummaryDto>(await harness!.get('/api/v1/dashboard/home', user.accessToken));
+
+    // The plan that covers today contributes tonight's dinner...
+    expect(home.todays_meals.some((meal) => meal.plan_id === currentPlanId)).toBe(true);
+
+    // ...while the stale plan — active, three weeks old, carrying an entry for
+    // today's *weekday* — does not. "Today's meals" used to match on
+    // day-of-week alone, so a user who planned two weeks in a row saw two
+    // dinners (last week's and this week's).
+    expect(home.todays_meals.some((meal) => meal.plan_id === stalePlanId)).toBe(false);
   });
 
   it('pairs each expiring item with an actionable recipe suggestion field', async () => {
