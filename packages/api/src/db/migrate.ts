@@ -92,12 +92,19 @@ export async function runMigrations(
 
 /** Rows in drizzle's bookkeeping table; 0 before the very first migration. */
 async function countAppliedMigrations(): Promise<number> {
+  type Rows = { rows?: Array<Record<string, unknown>> };
   try {
-    const result = await getDb().execute(
+    // Look before counting: on a fresh database a bare count fails, and the
+    // provider (e.g. Neon's monitoring) records that as a server-side ERROR.
+    const exists = (await getDb().execute(
+      sql`select to_regclass('drizzle.__drizzle_migrations') is not null as present`,
+    )) as unknown as Rows;
+    if (!exists.rows?.[0]?.present) return 0;
+
+    const result = (await getDb().execute(
       sql`select count(*)::int as count from drizzle.__drizzle_migrations`,
-    );
-    const row = (result as unknown as { rows?: Array<{ count?: number | string }> }).rows?.[0];
-    return Number(row?.count ?? 0);
+    )) as unknown as Rows;
+    return Number(result.rows?.[0]?.count ?? 0);
   } catch {
     return 0;
   }
