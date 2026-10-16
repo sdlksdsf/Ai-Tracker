@@ -77,6 +77,12 @@ jobs:
       - name: Audit the shipped API runtime tree
         run: node scripts/audit-runtime.mjs
 
+      # render.yaml against Render's own schema, plus cross-checks that its env
+      # vars, start command and health path exist in the code, and that
+      # apps/mobile/vercel.json matches what the Expo web export produces.
+      - name: Check deployment configuration
+        run: node scripts/check-deploy-config.mjs
+
   # ---------------------------------------------------------------------------
   # Unit tests — pure logic, no database. Runs on every push.
   # ---------------------------------------------------------------------------
@@ -263,12 +269,143 @@ jobs:
             && echo "ok: failed with a diagnostic message" \
             || { echo "server did not report the database problem"; exit 1; }
 
-      - name: Export the mobile web bundle
-        # A real bundler pass over the RN app: catches bad imports and missing
-        # modules that typechecking alone would miss.
-        run: npx expo export --platform web --output-dir /tmp/mobile-web
+      # Exactly what Vercel runs (apps/mobile/vercel.json → npm run build:web),
+      # including the EXPO_PUBLIC_API_URL guard. A real bundler pass over the RN
+      # app: catches bad imports and missing modules that typechecking misses.
+      # This step used to be continue-on-error, which hid that the web export
+      # could not resolve a single `.js`-suffixed import — it is blocking now.
+      - name: Build the website as Vercel does
+        run: npm run build:web
         working-directory: apps/mobile
-        continue-on-error: true
+        env:
+          VERCEL: '1'
+          EXPO_PUBLIC_API_URL: https://platematch-ci.onrender.com
+
+      - name: Verify the website bundle
+        working-directory: apps/mobile/dist
+        run: |
+          test -f index.html || { echo "missing dist/index.html"; exit 1; }
+          bundle=$(ls _expo/static/js/web/entry-*.js)
+          grep -q "https://platematch-ci.onrender.com" "$bundle" \
+            && echo "ok: API URL baked into $bundle" \
+            || { echo "EXPO_PUBLIC_API_URL was not inlined into the bundle"; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # Production boot — render.yaml's own build and start commands, NODE_ENV=production,
+  # against an EMPTY Postgres 17 (Neon's default) and Redis. Then the same smoke
+  # test users run against their live deployment (scripts/smoke-deploy.mjs).
+  #
+  # This is the path the other jobs never exercised: they migrate from source via
+  # tsx, while production runs the bundle — whose migrations folder resolved to a
+  # directory that does not exist, so it booted against an empty schema.
+  # ---------------------------------------------------------------------------
+  deploy-smoke:
+    name: Production boot (Render-style)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: verify
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: platematch
+          POSTGRES_PASSWORD: platematch
+          POSTGRES_DB: platematch
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U platematch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Render exposes service env vars during the build too — reproduce that,
+      # so a build command that skips devDependencies fails here first.
+      NODE_ENV: production
+      NODE_VERSION: '22'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build with render.yaml's buildCommand
+        run: |
+          cmd=$(sed -n 's/^ *buildCommand: *//p' render.yaml)
+          echo "render.yaml buildCommand: $cmd"
+          sh -c "$cmd"
+
+      - name: Start with render.yaml's startCommand (first deploy, empty database)
+        env:
+          PORT: '10000'
+          HOST: 0.0.0.0
+          RENDER_EXTERNAL_URL: http://localhost:10000
+          TRUST_PROXY: 'true'
+          DATABASE_URL: postgresql://platematch:platematch@localhost:5432/platematch
+          DATABASE_MIGRATE_ON_BOOT: 'true'
+          REDIS_URL: redis://localhost:6379
+          ENABLE_REDIS: 'true'
+          QUEUE_DRIVER: memory
+          ENABLE_WORKER: 'false'
+          ENABLE_CRONS: 'true'
+          STORAGE_DRIVER: cloudinary
+          # Syntactically valid, not real: nothing is uploaded in this job.
+          CLOUDINARY_CLOUD_NAME: platematch-ci
+          CLOUDINARY_API_KEY: '000000000000000'
+          CLOUDINARY_API_SECRET: not-a-real-secret
+          CORS_ORIGINS: https://platematch-ci.vercel.app
+          ENABLE_SWAGGER: 'false'
+          SEED_DEMO_USER: 'true'
+          AI_MODE: auto
+          LOG_LEVEL: info
+        run: |
+          # What Render's generateValue does — fresh random secrets per run.
+          export JWT_SECRET=$(openssl rand -base64 32)
+          export JWT_REFRESH_SECRET=$(openssl rand -base64 32)
+          export SEED_DEMO_PASSWORD=$(openssl rand -base64 32)
+          cmd=$(sed -n 's/^ *startCommand: *//p' render.yaml)
+          echo "render.yaml startCommand: $cmd"
+          nohup sh -c "$cmd" > /tmp/api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:10000/health/live > /dev/null 2>&1; then echo "API is up"; exit 0; fi
+            sleep 1
+          done
+          echo "API did not come up"; cat /tmp/api.log; exit 1
+
+      - name: Migrations ran on boot
+        run: |
+          grep -qE 'Applied [0-9]+ database migration' /tmp/api.log && echo "ok: schema created on first boot" \
+            || { echo "the first boot did not apply the migrations"; cat /tmp/api.log; exit 1; }
+
+      - name: Smoke test (the script users run against their live deployment)
+        run: node scripts/smoke-deploy.mjs --api http://localhost:10000 --origin https://platematch-ci.vercel.app --full --wait 30
+
+      - name: dist/migrate.js is idempotent (Render's pre-deploy command on paid plans)
+        env:
+          DATABASE_URL: postgresql://platematch:platematch@localhost:5432/platematch
+          JWT_SECRET: ci-only-access-secret-0123456789abcdef
+          JWT_REFRESH_SECRET: ci-only-refresh-secret-0123456789abcdef
+          STORAGE_DRIVER: cloudinary
+          CLOUDINARY_URL: cloudinary://000000000000000:not-a-real-secret@platematch-ci
+          ENABLE_REDIS: 'false'
+        run: node packages/api/dist/migrate.js | tee /tmp/migrate.log && grep -q 'schema is up to date' /tmp/migrate.log
+
+      - name: API log
+        if: always()
+        run: cat /tmp/api.log || true
 
   # ---------------------------------------------------------------------------
   # Supply chain

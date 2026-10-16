@@ -133,7 +133,8 @@ export async function startCrons(): Promise<void> {
           { task: cron.task },
           {
             pattern: cron.pattern,
-            jobId: `cron:${cron.key}`,
+            // No `:` — BullMQ rejects custom ids containing it ("Custom Id cannot contain :").
+            jobId: `cron-${cron.key}`,
             removeOnComplete: true,
           },
         );

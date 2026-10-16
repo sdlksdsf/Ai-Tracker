@@ -32,6 +32,9 @@ config.resolver.extraNodeModules = {
 // `resolveRequest` is what actually honours the mapping above, including the
 // subpath imports (`@platematch/shared/schemas`).
 const defaultResolveRequest = config.resolver.resolveRequest;
+const resolveDefault = (context, moduleName, platform) =>
+  defaultResolveRequest ? defaultResolveRequest(context, moduleName, platform) : context.resolveRequest(context, moduleName, platform);
+
 config.resolver.resolveRequest = (context, moduleName, platform) => {
   if (moduleName === '@platematch/shared') {
     return context.resolveRequest(context, path.resolve(workspaceRoot, 'packages/shared/src/index.ts'), platform);
@@ -44,7 +47,23 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
       platform,
     );
   }
-  return defaultResolveRequest ? defaultResolveRequest(context, moduleName, platform) : context.resolveRequest(context, moduleName, platform);
+
+  // TypeScript's ESM convention: the source says `import … from './api.js'`
+  // while only `api.ts` exists (tsc with moduleResolution "Bundler" maps it).
+  // Metro does not, so every one of these ~450 relative imports failed to
+  // resolve and `expo export --platform web` — the Vercel build — could not
+  // produce a bundle. Resolving without the extension also lets Metro pick
+  // platform files (`kv.web.ts` over `kv.ts`); the original specifier is the
+  // fallback for a genuine `.js` file.
+  if ((moduleName.startsWith('./') || moduleName.startsWith('../')) && moduleName.endsWith('.js')) {
+    try {
+      return resolveDefault(context, moduleName.slice(0, -3), platform);
+    } catch {
+      return resolveDefault(context, moduleName, platform);
+    }
+  }
+
+  return resolveDefault(context, moduleName, platform);
 };
 
 // Shared package sources are .ts, and Metro must be told to treat them as such.

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseCorsOrigins, primaryOrigin, type CorsPolicy } from '../lib/cors.js';
 
 /**
  * Environment configuration
@@ -7,8 +8,9 @@ import { z } from 'zod';
  * refuses to boot with a malformed configuration instead of failing later in a
  * request handler.
  *
- * Secrets are read from the environment only (Doppler / Railway / Fly secrets in
- * production, `.env` locally). Nothing is ever committed — see `.env.example`.
+ * Secrets are read from the environment only (the hosting dashboard — Render,
+ * Fly, Doppler… — in production, `.env` locally). Nothing is ever committed —
+ * see `.env.example` and docs/DEPLOYMENT.md.
  *
  * AI model identifiers are intentionally configurable: the defaults below point
  * at the current frontier models, and you can pin/upgrade them without a code
@@ -19,7 +21,7 @@ const booleanish = z
   .enum(['true', 'false', '1', '0', 'yes', 'no'])
   .transform((v) => v === 'true' || v === '1' || v === 'yes');
 
-const envSchema = z.object({
+export const envSchema = z.object({
   // ---- Runtime -----------------------------------------------------------
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
@@ -46,6 +48,15 @@ const envSchema = z.object({
   /** Without Redis the API falls back to an in-process queue (dev convenience). */
   ENABLE_REDIS: booleanish.default('true'),
   QUEUE_PREFIX: z.string().default('platematch'),
+  /**
+   * Where background jobs run.
+   *   auto   — BullMQ on Redis when Redis is enabled, otherwise in-process.
+   *   redis  — always BullMQ (requires ENABLE_REDIS=true). Pair with a worker service.
+   *   memory — always in-process, even when Redis serves the cache and rate limits.
+   *            The right choice for ONE instance on per-command-billed Redis (Upstash):
+   *            idle BullMQ workers poll Redis around the clock and exhaust a free tier.
+   */
+  QUEUE_DRIVER: z.enum(['auto', 'redis', 'memory']).default('auto'),
   ENABLE_WORKER: booleanish.default('true'),
 
   // ---- Auth --------------------------------------------------------------
@@ -115,6 +126,11 @@ const envSchema = z.object({
   // ---- Storage -----------------------------------------------------------
   /** 'cloudinary' | 's3' | 'local' — local writes to ./uploads and serves /uploads. */
   STORAGE_DRIVER: z.enum(['cloudinary', 's3', 'local']).default('local'),
+  /**
+   * Cloudinary's "API environment variable" — cloudinary://<api_key>:<api_secret>@<cloud_name>.
+   * One value instead of the three below; the discrete variables win when both are set.
+   */
+  CLOUDINARY_URL: z.string().optional(),
   CLOUDINARY_CLOUD_NAME: z.string().optional(),
   CLOUDINARY_API_KEY: z.string().optional(),
   CLOUDINARY_API_SECRET: z.string().optional(),
@@ -169,11 +185,29 @@ export type Env = z.infer<typeof envSchema>;
 
 let cached: Env | undefined;
 
+/**
+ * Non-fatal configuration advice gathered while parsing. `server.ts` logs these
+ * once at boot — this module cannot use the logger (the logger imports it).
+ */
+export const envWarnings: string[] = [];
+
 /** Parse (and memoise) the process environment. */
 export function loadEnv(overrides: Partial<Record<keyof Env, unknown>> = {}): Env {
   if (cached && Object.keys(overrides).length === 0) return cached;
 
-  const merged = { ...process.env, ...stripUndefined(overrides) };
+  const merged: Record<string, unknown> = { ...process.env, ...stripUndefined(overrides) };
+  /** Was a variable actually provided (as opposed to falling back to a default)? */
+  const provided = (key: string): boolean => typeof merged[key] === 'string' && (merged[key] as string).trim() !== '';
+
+  // ---- Platform-derived defaults -------------------------------------------
+  // Render injects its public URL; use it so APP_URL never needs setting by hand.
+  if (!provided('APP_URL') && provided('RENDER_EXTERNAL_URL')) merged.APP_URL = merged.RENDER_EXTERNAL_URL;
+  // The website that calls the API is, by definition, the first allowed origin.
+  // Parse exactly what the schema will see: unset → '*', but an empty string
+  // (a dashboard field left blank) stays empty and blocks every browser origin.
+  const cors = parseCorsOrigins(typeof merged.CORS_ORIGINS === 'string' ? merged.CORS_ORIGINS : '*');
+  if (!provided('FRONTEND_URL') && primaryOrigin(cors)) merged.FRONTEND_URL = primaryOrigin(cors);
+
   const parsed = envSchema.safeParse(merged);
 
   if (!parsed.success) {
@@ -186,17 +220,68 @@ export function loadEnv(overrides: Partial<Record<keyof Env, unknown>> = {}): En
   }
 
   const env = parsed.data;
+  const problems: string[] = [];
 
-  // Fail fast on production misconfiguration.
+  // ---- Cloudinary: one URL → three settings ----------------------------------
+  if (env.CLOUDINARY_URL) {
+    const fromUrl = parseCloudinaryUrl(env.CLOUDINARY_URL);
+    if (!fromUrl) {
+      problems.push(
+        'CLOUDINARY_URL must look like cloudinary://<api_key>:<api_secret>@<cloud_name> ' +
+          '(copy the "API environment variable" from Cloudinary → Settings → API Keys)',
+      );
+    } else {
+      env.CLOUDINARY_CLOUD_NAME ??= fromUrl.cloudName;
+      env.CLOUDINARY_API_KEY ??= fromUrl.apiKey;
+      env.CLOUDINARY_API_SECRET ??= fromUrl.apiSecret;
+    }
+  }
+
+  // ---- Cross-field rules that hold in every environment ----------------------
+  if (env.QUEUE_DRIVER === 'redis' && !env.ENABLE_REDIS) {
+    problems.push('QUEUE_DRIVER=redis needs ENABLE_REDIS=true (or use QUEUE_DRIVER=memory)');
+  }
+  if (cors.invalid.length) {
+    problems.push(
+      `CORS_ORIGINS has entries that can never match a browser origin: ${cors.invalid.map((e) => `"${e}"`).join(', ')}. ` +
+        'Use the full origin with no path, e.g. https://your-app.vercel.app',
+    );
+  }
+
+  // ---- Fail fast on production misconfiguration ------------------------------
   if (env.NODE_ENV === 'production') {
-    const problems: string[] = [];
     if (env.JWT_SECRET.includes('dev-only')) problems.push('JWT_SECRET is still the development default');
     if (env.JWT_REFRESH_SECRET.includes('dev-only'))
       problems.push('JWT_REFRESH_SECRET is still the development default');
     if (env.STORAGE_DRIVER === 'local') problems.push('STORAGE_DRIVER=local is not suitable for production');
-    if (problems.length) {
-      throw new Error(`Refusing to start in production:\n - ${problems.join('\n - ')}`);
+    if (env.STORAGE_DRIVER === 'cloudinary' && !(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET)) {
+      problems.push(
+        'STORAGE_DRIVER=cloudinary but Cloudinary credentials are missing — set CLOUDINARY_CLOUD_NAME, ' +
+          'CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET (Cloudinary → Settings → API Keys), or CLOUDINARY_URL',
+      );
     }
+    if (env.STORAGE_DRIVER === 's3' && !(env.S3_BUCKET && env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY)) {
+      problems.push('STORAGE_DRIVER=s3 but S3_BUCKET / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are missing');
+    }
+    if (!provided('DATABASE_URL')) {
+      problems.push('DATABASE_URL is not set — paste your PostgreSQL (Neon) connection string');
+    }
+    if (env.ENABLE_REDIS && !provided('REDIS_URL')) {
+      problems.push('ENABLE_REDIS=true but REDIS_URL is not set — paste your Redis (Upstash) rediss:// URL, or set ENABLE_REDIS=false');
+    }
+    if (cors.allowAll) {
+      envWarnings.push(
+        'CORS_ORIGINS is "*" — any website can call this API from a browser. Set it to your frontend URL, e.g. https://your-app.vercel.app',
+      );
+    } else if (!cors.exact.size && !cors.patterns.length && !cors.invalid.length) {
+      envWarnings.push('CORS_ORIGINS is empty — browsers on every website, including yours, will be blocked. Set it to your frontend URL.');
+    }
+  }
+
+  if (problems.length) {
+    throw new Error(
+      `${env.NODE_ENV === 'production' ? 'Refusing to start in production' : 'Invalid configuration'}:\n - ${problems.join('\n - ')}`,
+    );
   }
 
   if (Object.keys(overrides).length === 0) cached = env;
@@ -205,6 +290,26 @@ export function loadEnv(overrides: Partial<Record<keyof Env, unknown>> = {}): En
 
 function stripUndefined(obj: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
+/** `cloudinary://<api_key>:<api_secret>@<cloud_name>` → its parts, or null when malformed. */
+export function parseCloudinaryUrl(raw: string): { cloudName: string; apiKey: string; apiSecret: string } | null {
+  // People paste the whole line from the console, `CLOUDINARY_URL=` prefix included.
+  const value = raw.trim().replace(/^CLOUDINARY_URL=/, '');
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'cloudinary:') return null;
+
+  const apiKey = decodeURIComponent(url.username);
+  const apiSecret = decodeURIComponent(url.password);
+  const cloudName = url.hostname;
+  // The console shows placeholders / a masked secret until you reveal it — catch both.
+  if (!apiKey || !apiSecret || !cloudName || /[<>]/.test(value) || /^\*+$/.test(apiSecret)) return null;
+  return { cloudName, apiKey, apiSecret };
 }
 
 /** Test/dev helper — clears the memoised env so overrides take effect. */
@@ -222,8 +327,8 @@ export const isProduction = env.NODE_ENV === 'production';
 export const isTest = env.NODE_ENV === 'test';
 export const isDevelopment = env.NODE_ENV === 'development';
 
-export const corsOrigins: string[] | '*' =
-  env.CORS_ORIGINS === '*' ? '*' : env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean);
+/** The parsed `CORS_ORIGINS` allow-list (see lib/cors.ts). */
+export const corsPolicy: CorsPolicy = parseCorsOrigins(env.CORS_ORIGINS);
 
 /** True when we have credentials for at least one vision provider. */
 export const hasVisionKeys = Boolean(env.GEMINI_API_KEY || env.OPENAI_API_KEY);

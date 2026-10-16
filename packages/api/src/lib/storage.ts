@@ -148,13 +148,19 @@ async function uploadCloudinary(input: UploadInput): Promise<UploadResult> {
   const timestamp = Math.floor(Date.now() / 1000);
 
   // Signed upload: sha1(params + api_secret)
+  //
+  // No incoming `transformation`. This used to send `f_auto,q_auto`, which
+  // Cloudinary documents as "never use f_auto in an incoming transformation"
+  // (format must be chosen per browser at delivery time). The bytes arriving
+  // here are already downscaled and re-encoded as JPEG q85 by lib/image.ts, so
+  // an incoming q_auto would only compress them a second time. Apply
+  // f_auto/q_auto in delivery URLs instead.
   const params: Record<string, string | number> = {
     timestamp,
     folder,
     public_id: publicId,
     overwrite: 'false',
-    // Auto-format + quality for the CDN, plus responsive derivatives.
-    transformation: 'f_auto,q_auto',
+    // Responsive derivatives, generated in the background.
     eager: 'w_150,c_fill|w_300,c_fill|w_600,c_fill|w_1200,c_fill',
     eager_async: 'true',
   };
@@ -177,7 +183,13 @@ async function uploadCloudinary(input: UploadInput): Promise<UploadResult> {
 
   if (!res.ok) {
     const body = await res.text();
-    logger.error({ status: res.status, body }, 'Cloudinary upload failed');
+    const hint =
+      res.status === 401 || res.status === 403
+        ? 'Cloudinary rejected the credentials — re-copy CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET (reveal the secret first; not the masked ****)'
+        : res.status === 404
+          ? 'Unknown Cloudinary cloud name — check CLOUDINARY_CLOUD_NAME'
+          : 'Cloudinary refused the upload';
+    logger.error({ status: res.status, body, cloud }, `Cloudinary upload failed: ${hint}`);
     throw new UpstreamServiceError(`Cloudinary upload failed (${res.status})`);
   }
 

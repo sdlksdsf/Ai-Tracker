@@ -164,13 +164,24 @@ class InProcessQueue<T> implements QueueLike<T> {
 // BullMQ implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * BullMQ forbids `:` in queue names (it is its own key separator) and namespaces
+ * every key with `prefix` instead. Queue names used to be `platematch:scan`,
+ * which made `new Queue()` throw "Queue name cannot contain :" — so with Redis
+ * enabled the API crashed at boot, or failed every scan upload with a 500.
+ */
+export function toBullQueueName(name: string): string {
+  return name.replace(/:/g, '-');
+}
+
 class RedisQueue<T> implements QueueLike<T> {
   readonly isRedisBacked = true;
   readonly queue: Queue<T>;
 
   constructor(readonly name: string, private readonly connection: ConnectionOptions) {
-    this.queue = new Queue<T>(name, {
+    this.queue = new Queue<T>(toBullQueueName(name), {
       connection,
+      prefix: env.QUEUE_PREFIX,
       defaultJobOptions: {
         attempts: 3,
         backoff: { type: 'exponential', delay: 2_000 },
@@ -215,26 +226,39 @@ function sleep(ms: number): Promise<void> {
 // Registry
 // ---------------------------------------------------------------------------
 
+/**
+ * Queue names. Redis keys are namespaced by BullMQ's `prefix` (QUEUE_PREFIX), so
+ * these end up as `platematch:scan:*` — the names themselves must not contain `:`.
+ */
 export const QUEUE_NAMES = {
-  scan: `${env.QUEUE_PREFIX}:scan`,
-  recipe: `${env.QUEUE_PREFIX}:recipe`,
-  mealplan: `${env.QUEUE_PREFIX}:mealplan`,
-  nutrition: `${env.QUEUE_PREFIX}:nutrition`,
-  prices: `${env.QUEUE_PREFIX}:prices`,
-  notifications: `${env.QUEUE_PREFIX}:notifications`,
-  maintenance: `${env.QUEUE_PREFIX}:maintenance`,
+  scan: 'scan',
+  recipe: 'recipe',
+  mealplan: 'mealplan',
+  nutrition: 'nutrition',
+  prices: 'prices',
+  notifications: 'notifications',
+  maintenance: 'maintenance',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
 const registry = new Map<string, QueueLike<never>>();
 
+/**
+ * Which back-end queues use — see QUEUE_DRIVER in config/env.ts.
+ * `memory` keeps jobs in-process even when Redis serves the cache and limits.
+ */
+export function queueDriver(): 'redis' | 'memory' {
+  if (env.QUEUE_DRIVER === 'memory' || !env.ENABLE_REDIS) return 'memory';
+  return getRedisClient() ? 'redis' : 'memory';
+}
+
 /** Get (or create) a queue. Falls back to in-process when Redis is down. */
 export function getQueue<T = unknown>(name: QueueName | string): QueueLike<T> {
   const existing = registry.get(name);
   if (existing) return existing as unknown as QueueLike<T>;
 
-  const connection = env.ENABLE_REDIS ? getRedisClient() : null;
+  const connection = queueDriver() === 'redis' ? getRedisClient() : null;
 
   let queue: QueueLike<T>;
   if (connection) {
@@ -250,7 +274,7 @@ export function getQueue<T = unknown>(name: QueueName | string): QueueLike<T> {
 }
 
 export function isRedisBacked(): boolean {
-  return Boolean(env.ENABLE_REDIS && getRedisClient());
+  return queueDriver() === 'redis';
 }
 
 /** Attach a BullMQ worker (no-op for in-process queues, which self-execute). */
@@ -265,9 +289,18 @@ export function attachWorker<T>(name: QueueName | string, processor: Processor<T
   const connection = getRedisClient();
   if (!connection) return null;
 
-  const worker = new Worker<T>(name, processor, {
+  const worker = new Worker<T>(toBullQueueName(name), processor, {
     connection: connection as ConnectionOptions,
+    // Must match the Queue's prefix or the worker listens on different keys.
+    prefix: env.QUEUE_PREFIX,
     concurrency,
+    // How long an idle worker blocks before polling again. BullMQ's default (5s)
+    // made five idle workers send ~490 Redis commands a minute (measured) —
+    // ~21M a month, against Upstash's 500K free tier. A new job still wakes a
+    // blocked worker immediately (BullMQ adds a marker on enqueue), and queues
+    // with delayed/repeatable jobs wake on their own timer, so a longer block
+    // only removes idle polling. Single instance? Prefer QUEUE_DRIVER=memory.
+    drainDelay: 30,
     removeOnComplete: { age: 3600 },
     removeOnFail: { age: 7 * 24 * 3600 },
   });

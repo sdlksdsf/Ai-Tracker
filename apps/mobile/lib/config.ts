@@ -40,12 +40,26 @@ function lanHostFromExpo(): string | null {
   return host && /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? host : null;
 }
 
-function resolveApiBaseUrl(): string {
-  const override = process.env.EXPO_PUBLIC_API_URL?.trim();
-  if (override) return override.replace(/\/+$/, '');
+/**
+ * The API *root*: no trailing slash and no `/api/v1` — the prefix is appended
+ * below, and pasting the full API URL (a common slip) would otherwise produce
+ * `/api/v1/api/v1/...` and a 404 on every request.
+ */
+function cleanBaseUrl(value: string): string {
+  return value
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/api\/v1$/i, '');
+}
 
-  const fromExtra = readExtra().apiBaseUrl?.trim();
-  if (fromExtra) return fromExtra.replace(/\/+$/, '');
+function resolveApiBaseUrl(): string {
+  // Must be read as the literal `process.env.EXPO_PUBLIC_API_URL`: Expo inlines
+  // it into the bundle at build time (on Vercel, from the project's env vars).
+  const override = process.env.EXPO_PUBLIC_API_URL;
+  if (override?.trim()) return cleanBaseUrl(override);
+
+  const fromExtra = readExtra().apiBaseUrl;
+  if (fromExtra?.trim()) return cleanBaseUrl(fromExtra);
 
   const lan = lanHostFromExpo();
   if (lan) return `http://${lan}:4000`;
