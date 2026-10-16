@@ -1,9 +1,18 @@
-import { env, hasReasoningKeys, hasStripeKeys, hasVisionKeys, isProduction } from './config/env.js';
+import {
+  corsPolicy,
+  env,
+  envWarnings,
+  hasReasoningKeys,
+  hasStripeKeys,
+  hasVisionKeys,
+  isProduction,
+} from './config/env.js';
 import { logger } from './lib/logger.js';
 import { getDb, closeDatabase, checkDatabase } from './db/index.js';
 import { runMigrations, ensureExtensions } from './db/migrate.js';
 import { closeCache } from './lib/redis.js';
 import { closeQueues, isRedisBacked } from './lib/queue.js';
+import { storageDriverName } from './lib/storage.js';
 import { flushTelemetry } from './plugins/telemetry.js';
 import { startApp } from './app.js';
 import { seedDemoData } from './db/seed.js';
@@ -49,8 +58,9 @@ async function main(): Promise<void> {
   });
 
   if (env.DATABASE_MIGRATE_ON_BOOT) {
-    logger.info('Running migrations');
     await runMigrations();
+  } else {
+    logger.info('DATABASE_MIGRATE_ON_BOOT=false — expecting migrations to run as a separate step');
   }
 
   // Warm the Drizzle instance so the first request is not paying for it.
@@ -89,6 +99,20 @@ async function main(): Promise<void> {
   }
 
   // ---- 4. HTTP server ----------------------------------------------------
+  for (const warning of envWarnings) logger.warn(warning);
+  // One line that answers "is this deploy wired the way I think?" in the logs.
+  logger.info(
+    {
+      storage: storageDriverName(),
+      cache: env.ENABLE_REDIS ? 'redis' : 'in-memory',
+      queue: isRedisBacked() ? 'redis (BullMQ)' : 'in-process',
+      crons: env.ENABLE_CRONS && ownsJobs,
+      cors: corsPolicy.entries,
+      trustProxy: env.TRUST_PROXY,
+    },
+    'Deployment configuration',
+  );
+
   const app = await startApp();
 
   // ---- 5. Graceful shutdown ---------------------------------------------

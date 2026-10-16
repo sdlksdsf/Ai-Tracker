@@ -354,6 +354,20 @@ Production hardening is enforced, not suggested: a dev-default `JWT_SECRET` or `
 
 ## Deployment
 
+### Free-tier cloud: Vercel + Render + Neon + Upstash + Cloudinary
+
+**Step-by-step dashboard guide: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)** — no command line needed.
+
+| Piece | Service | Configured by |
+|---|---|---|
+| Website (`apps/mobile`, Expo web) | Vercel | [`apps/mobile/vercel.json`](apps/mobile/vercel.json) — Root Directory `apps/mobile`, `EXPO_PUBLIC_API_URL` |
+| API (`packages/api`) | Render | [`render.yaml`](render.yaml) Blueprint — health check `/health/live`, migrations on boot |
+| PostgreSQL | Neon | `DATABASE_URL` |
+| Redis (cache, rate limits) | Upstash | `REDIS_URL` (`rediss://`), jobs in-process via `QUEUE_DRIVER=memory` |
+| Uploads | Cloudinary | `CLOUDINARY_CLOUD_NAME` / `_API_KEY` / `_API_SECRET` |
+
+`node scripts/check-deploy-config.mjs` validates `render.yaml` against Render's schema and both configs against the code (CI runs it), and `node scripts/smoke-deploy.mjs --api … --web …` — or **Actions → Deploy check** — tests a live deployment from the outside.
+
 ### Containers
 
 ```bash
@@ -376,6 +390,8 @@ docker run -d --env-file .env -e ENABLE_CRONS=true               platematch/work
 npm run db:migrate      # apply pending migrations
 npm run db:generate     # generate SQL after editing schema.ts
 npm run db:seed         # idempotent demo data
+
+node packages/api/dist/migrate.js   # production: the built bundle, no tsx needed
 ```
 
 Migrations are committed SQL (`packages/api/drizzle/0000_init.sql` — 28 tables, 16 enums, 75 indexes). CI runs `drizzle-kit check` to catch a `schema.ts` edit that was never generated into SQL — the drift that turns a green build into a broken deploy.

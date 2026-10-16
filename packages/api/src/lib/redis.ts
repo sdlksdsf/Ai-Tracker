@@ -176,14 +176,29 @@ class RedisCache implements CacheDriver {
 // Factory / singleton
 // ---------------------------------------------------------------------------
 
-function buildRedisOptions(): RedisOptions {
-  return {
+export function buildRedisOptions(url: string = env.REDIS_URL): RedisOptions {
+  const options: RedisOptions = {
     maxRetriesPerRequest: null, // required by BullMQ
     enableReadyCheck: true,
     lazyConnect: false,
     retryStrategy: (times) => Math.min(times * 200, 5_000),
     reconnectOnError: (err) => err.message.includes('READONLY'),
   };
+
+  // Upstash only accepts TLS. A `rediss://` URL turns TLS on by itself; a
+  // `redis://` one copied from the wrong tab would otherwise hang in a
+  // reconnect loop with nothing but "Connection is closed" in the logs.
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'redis:' && parsed.hostname.endsWith('.upstash.io')) {
+      options.tls = {};
+      logger.warn('REDIS_URL uses redis:// but Upstash requires TLS — connecting with TLS anyway. Use the rediss:// URL.');
+    }
+  } catch {
+    /* not URL-shaped; ioredis reports it */
+  }
+
+  return options;
 }
 
 let driver: CacheDriver | null = null;
@@ -200,7 +215,7 @@ export function getCache(): CacheDriver {
   }
 
   try {
-    redisClient = new Redis(env.REDIS_URL, buildRedisOptions());
+    redisClient = new Redis(env.REDIS_URL, buildRedisOptions(env.REDIS_URL));
     driver = new RedisCache(redisClient);
   } catch (err) {
     logger.warn({ err }, 'Could not create Redis client — falling back to in-memory cache');

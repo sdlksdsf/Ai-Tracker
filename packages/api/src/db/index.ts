@@ -37,7 +37,7 @@ export function getPool(): pg.Pool {
   if (pool) return pool;
 
   pool = new Pool({
-    connectionString: env.DATABASE_URL,
+    connectionString: normalizeDatabaseUrl(env.DATABASE_URL),
     max: env.DATABASE_POOL_MAX,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
@@ -52,6 +52,32 @@ export function getPool(): pg.Pool {
   });
 
   return pool;
+}
+
+/**
+ * Pin `sslmode` to what node-postgres already does today.
+ *
+ * pg 8.x treats `sslmode=require|prefer|verify-ca` (what Neon, Supabase and
+ * most providers put in their connection strings) as `verify-full` — the
+ * certificate IS checked — and prints a multi-line "SECURITY WARNING" on every
+ * boot because pg 9 will switch those modes to libpq's weaker semantics. Writing
+ * `verify-full` explicitly keeps today's behaviour, silences a warning that
+ * alarms anyone reading deploy logs, and means a future pg upgrade cannot
+ * quietly stop verifying certificates. `uselibpqcompat=true` opts out.
+ */
+export function normalizeDatabaseUrl(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return raw; // not URL-shaped (e.g. a libpq keyword string) — leave it to pg
+  }
+  const mode = url.searchParams.get('sslmode');
+  if (mode && ['require', 'prefer', 'verify-ca'].includes(mode) && url.searchParams.get('uselibpqcompat') !== 'true') {
+    url.searchParams.set('sslmode', 'verify-full');
+    return url.toString();
+  }
+  return raw;
 }
 
 /** Managed Postgres hosts (Supabase, Neon, RDS) require TLS. */

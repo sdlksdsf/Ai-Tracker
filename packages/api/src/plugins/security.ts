@@ -4,8 +4,24 @@ import cors from '@fastify/cors';
 import compress from '@fastify/compress';
 import cookie from '@fastify/cookie';
 import type { FastifyInstance } from 'fastify';
-import { env, corsOrigins, isProduction } from '../config/env.js';
+import { env, corsPolicy, isProduction } from '../config/env.js';
+import { isOriginAllowed } from '../lib/cors.js';
 import { logger } from '../lib/logger.js';
+
+/**
+ * A blocked origin is logged once per process. The browser only says "CORS
+ * error" — without this line the API log is silent and the cause (an origin
+ * missing from CORS_ORIGINS, a trailing slash, http vs https) is guesswork.
+ */
+const reportedOrigins = new Set<string>();
+function reportBlockedOrigin(origin: string): void {
+  if (reportedOrigins.has(origin) || reportedOrigins.size >= 50) return;
+  reportedOrigins.add(origin);
+  logger.warn(
+    { origin, allowed: corsPolicy.entries },
+    `CORS: blocked a browser request from ${origin}. If this is your website, add it to CORS_ORIGINS.`,
+  );
+}
 
 /**
  * Security + transport plugins (Section 8).
@@ -42,7 +58,16 @@ async function securityPlugin(app: FastifyInstance): Promise<void> {
   });
 
   await app.register(cors, {
-    origin: corsOrigins,
+    // Requests without an Origin header (curl, native apps, health probes) are
+    // not CORS requests: they get no CORS headers and are otherwise unaffected.
+    origin: corsPolicy.allowAll
+      ? '*'
+      : (origin, callback) => {
+          if (!origin) return callback(null, false);
+          if (isOriginAllowed(corsPolicy, origin)) return callback(null, true);
+          reportBlockedOrigin(origin);
+          return callback(null, false);
+        },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'If-None-Match', 'X-Client-Version', 'X-Device-Id'],
@@ -77,7 +102,7 @@ async function securityPlugin(app: FastifyInstance): Promise<void> {
   });
 
   logger.debug(
-    { cors: corsOrigins, compress: true, helmet: true },
+    { cors: corsPolicy.entries, compress: true, helmet: true },
     'Security plugins registered',
   );
 }

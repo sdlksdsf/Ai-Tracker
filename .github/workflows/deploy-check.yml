@@ -1,0 +1,50 @@
+name: Deploy check
+
+# Checks a LIVE deployment from the outside — no secrets needed, only the two
+# public addresses. Run it from GitHub: Actions → Deploy check → Run workflow.
+# The same script runs locally: node scripts/smoke-deploy.mjs --api … --web …
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'API address (Render), e.g. https://platematch-api.onrender.com'
+        required: true
+        type: string
+      web_url:
+        description: 'Website address (Vercel), e.g. https://platematch.vercel.app — leave empty to check only the API'
+        required: false
+        type: string
+      full:
+        description: 'Also create, use and delete a throwaway account'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Smoke-test the deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Inputs go through env, never straight into the script text.
+      - name: Run checks
+        env:
+          API_URL: ${{ inputs.api_url }}
+          WEB_URL: ${{ inputs.web_url }}
+          FULL: ${{ inputs.full }}
+        run: |
+          set -- --api "$API_URL"
+          if [ -n "$WEB_URL" ]; then set -- "$@" --web "$WEB_URL"; fi
+          if [ "$FULL" = "true" ]; then set -- "$@" --full; fi
+          node scripts/smoke-deploy.mjs "$@"

@@ -1,0 +1,134 @@
+# Render Blueprint — the PlateMatch API (packages/api) as ONE web service.
+#
+#   Website   → Vercel       (apps/mobile, see apps/mobile/vercel.json)
+#   API       → Render       (this file)
+#   Postgres  → Neon         DATABASE_URL
+#   Redis     → Upstash      REDIS_URL
+#   Uploads   → Cloudinary   CLOUDINARY_URL
+#
+# Step-by-step dashboard guide: docs/DEPLOYMENT.md
+#
+# Secrets are NEVER written in this file:
+#   sync: false        Render asks you for the value once, when you create the
+#                      Blueprint, and keeps it in the Render dashboard.
+#   generateValue      Render invents a strong random value and keeps it.
+# Render only asks for `sync: false` values on FIRST creation — change them later
+# in the dashboard (service → Environment), not here.
+#
+# Validated against https://render.com/schema/render.yaml.json in CI.
+
+services:
+  - type: web
+    name: platematch-api
+    runtime: node
+    # Free: sleeps after 15 min without traffic (first request then takes ~1 min)
+    # and cannot use a pre-deploy command. "starter" keeps it always on.
+    plan: free
+    # Cannot be changed after creation. Create your Neon and Upstash databases
+    # in the same area (Neon: AWS Asia Pacific 1 · Upstash: ap-southeast-1).
+    # Most users in Europe? Use frankfurt here and eu-central-1 for both.
+    region: singapore
+    # Deploys the repo's default branch (main) on every push that touches the API.
+    autoDeployTrigger: commit
+    buildFilter:
+      paths:
+        - packages/api/**
+        - packages/shared/**
+        - package.json
+        - package-lock.json
+        - render.yaml
+    # --include=dev: NODE_ENV=production is visible during the build too, and
+    # without this flag npm would skip the TypeScript bundler (a devDependency).
+    buildCommand: npm ci --include=dev && npm run build --workspace=@platematch/api
+    # Applies pending database migrations on start (DATABASE_MIGRATE_ON_BOOT),
+    # then serves on the PORT Render provides.
+    startCommand: node packages/api/dist/server.js
+    # Paid plans: move migrations out of the start path —
+    #   preDeployCommand: node packages/api/dist/migrate.js
+    # and set DATABASE_MIGRATE_ON_BOOT to "false".
+    #
+    # Liveness only: answers without touching Neon or Upstash, so probing it
+    # every few seconds neither keeps the database awake nor spends Redis
+    # commands. Use /health/ready (database + Redis) to check a deploy by hand.
+    healthCheckPath: /health/live
+    envVars:
+      # ---- Runtime ------------------------------------------------------------
+      - key: NODE_VERSION
+        value: '22'
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      # Render's proxy sets X-Forwarded-For; trust it so rate limits see real IPs.
+      - key: TRUST_PROXY
+        value: 'true'
+      - key: LOG_LEVEL
+        value: info
+      - key: ENABLE_SWAGGER
+        value: 'false'
+
+      # ---- Website allowed to call this API (CORS) ------------------------------
+      # Your Vercel address, e.g. https://platematch.vercel.app — no trailing
+      # slash, no path. Several? Separate with commas. Preview deployments:
+      # add https://<project>-*-<team>.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+
+      # ---- Database: Neon ---------------------------------------------------------
+      # Neon → Connect → copy the connection string (postgresql://…sslmode=require).
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_MIGRATE_ON_BOOT
+        value: 'true'
+
+      # ---- Redis: Upstash -----------------------------------------------------------
+      # Upstash → your database → the rediss:// URL (TLS). Used for the cache and
+      # rate limits. Jobs run inside this one instance (QUEUE_DRIVER=memory):
+      # BullMQ's idle polling alone would use up Upstash's free 500K commands a
+      # month within a day.
+      - key: REDIS_URL
+        sync: false
+      - key: ENABLE_REDIS
+        value: 'true'
+      - key: QUEUE_DRIVER
+        value: memory
+      - key: ENABLE_WORKER
+        value: 'false'
+      - key: ENABLE_CRONS
+        value: 'true'
+
+      # ---- Uploads: Cloudinary ----------------------------------------------------
+      # Cloudinary → Settings → API Keys: copy the three values as they are
+      # (click the eye icon to reveal the API secret before copying it).
+      - key: STORAGE_DRIVER
+        value: cloudinary
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: platematch
+
+      # ---- Sign-in tokens ---------------------------------------------------------
+      # Generated once by Render. Regenerating them signs every user out.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+
+      # ---- Starter content ----------------------------------------------------------
+      # Seeds the public recipe library (owned by a demo account). The demo
+      # account gets a random password — nobody can sign in with the public one
+      # from the README.
+      - key: SEED_DEMO_USER
+        value: 'true'
+      - key: SEED_DEMO_PASSWORD
+        generateValue: true
+
+      # ---- AI -----------------------------------------------------------------------
+      # "auto" uses the built-in engine until you add GEMINI_API_KEY /
+      # OPENAI_API_KEY / ANTHROPIC_API_KEY in the dashboard.
+      - key: AI_MODE
+        value: auto

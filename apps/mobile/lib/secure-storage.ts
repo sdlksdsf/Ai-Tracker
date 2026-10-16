@@ -6,9 +6,16 @@ import { kv } from './kv.js';
  * Secret storage.
  *
  * Tokens live in the iOS Keychain / Android Keystore via expo-secure-store. That
- * module is native-only, so on web (and in tests) the tokens fall back to the
- * MMKV store. This is a deliberate, documented trade-off: the web build is a
- * preview target, not a place anyone signs in with a real account.
+ * module is native-only, so on web the tokens go through `kv`, which is backed
+ * by `localStorage` there (in-memory in tests).
+ *
+ * That is the usual single-page-app trade-off, made deliberately now that the
+ * web build is deployed (Vercel): the session survives a page refresh, and the
+ * cost is that script injected into the page could read the tokens. It is
+ * bounded by 15-minute access tokens and rotating refresh tokens whose whole
+ * family is revoked on reuse. The alternative — httpOnly cookies — would need a
+ * same-site API domain, because browsers increasingly block third-party
+ * cookies between *.vercel.app and *.onrender.com.
  *
  * Every call is async and never throws — a Keychain prompt the user dismisses
  * must not crash the app, it must just leave them signed out.

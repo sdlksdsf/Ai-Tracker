@@ -13,7 +13,7 @@ import { SwitchRow, SettingsGroup } from './_components.js';
 import { OptionSheet, type SheetOption } from '../../components/ui/Sheet.js';
 import { useUiStore } from '../../stores/ui.store.js';
 import { SUPPORTED_LOCALES, changeLocale } from '../../i18n/index.js';
-import { kv, StorageKeys, isPersistent } from '../../lib/kv.js';
+import { kv, StorageKeys, isPersistent, storageBackend } from '../../lib/kv.js';
 import { config } from '../../lib/config.js';
 import { toast } from '../../stores/ui.store.js';
 
@@ -115,7 +115,7 @@ export default function SettingsScreen(): React.ReactElement {
 
       <SettingsGroup title={t('data')}>
         <Card flush>
-          <PressableRow icon="trash-outline" label={t('cache')} value={isPersistent ? 'MMKV' : 'in memory'} onPress={clearCache} testID="settings-clear-cache" />
+          <PressableRow icon="trash-outline" label={t('cache')} value={storageBackend} onPress={clearCache} testID="settings-clear-cache" />
           <PressableRow icon="information-circle-outline" label={t('about')} onPress={() => router.push('/settings/about')} last testID="settings-about" />
         </Card>
       </SettingsGroup>
@@ -125,7 +125,7 @@ export default function SettingsScreen(): React.ReactElement {
           <Card flush>
             <InfoRow icon="server-outline" label="API" value={config.apiBaseUrl} />
             <InfoRow icon="hardware-chip-outline" label="Environment" value={config.environment} />
-            <InfoRow icon="cube-outline" label="Storage" value={isPersistent ? 'persistent' : 'volatile (web/test)'} />
+            <InfoRow icon="cube-outline" label="Storage" value={isPersistent ? 'persistent' : 'volatile (tests / storage disabled)'} />
             <PressableRow icon="refresh-outline" label={t('resetOnboarding')} onPress={() => { kv.delete(StorageKeys.onboardingSeen); toast('Onboarding will replay on next launch', 'success'); }} last />
           </Card>
         </SettingsGroup>

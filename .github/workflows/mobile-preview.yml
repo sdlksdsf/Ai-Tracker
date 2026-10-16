@@ -30,11 +30,11 @@ jobs:
         run: npm ci --ignore-scripts
 
       # Catches broken imports and missing modules across the whole app graph —
-      # the failures typechecking cannot see.
+      # the failures typechecking cannot see. Blocking: as continue-on-error it
+      # stayed green while the export could not resolve the app's own imports.
       - name: Export web bundle
         working-directory: apps/mobile
         run: npx expo export --platform web --output-dir dist-web
-        continue-on-error: true
 
       - name: Report
         if: always()

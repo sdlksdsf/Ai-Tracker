@@ -9,7 +9,8 @@ export default defineConfig({
   entry: {
     server: 'src/server.ts',
     worker: 'src/worker.ts',
-    migrate: 'src/db/migrate.ts',
+    // Its own CLI file: a CLI guard inside migrate.ts misfired once bundled into server.js.
+    migrate: 'src/db/migrate-cli.ts',
     seed: 'src/db/seed.ts',
   },
   format: ['esm'],

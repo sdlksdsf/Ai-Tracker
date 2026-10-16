@@ -38,8 +38,12 @@
     },
     "web": {
       "bundler": "metro",
-      "output": "static",
-      "favicon": "./assets/favicon.png"
+      "output": "single",
+      "favicon": "./assets/favicon.png",
+      "name": "PlateMatch",
+      "shortName": "PlateMatch",
+      "themeColor": "#2D8F4E",
+      "backgroundColor": "#FFFFFF"
     },
     "plugins": [
       "expo-router",

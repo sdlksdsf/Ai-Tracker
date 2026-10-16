@@ -1,6 +1,7 @@
 import { endpointUrl, config } from './config.js';
 import { secureStorage } from './secure-storage.js';
 import { kv, StorageKeys } from './kv.js';
+import { appendImagePart } from './upload-part.js';
 
 /**
  * HTTP client.
@@ -399,12 +400,9 @@ export const api = {
   ): Promise<T> {
     const form = new FormData();
 
-    // React Native accepts this shape; the web type is stricter, hence the cast.
-    form.append('image', {
-      uri: file.uri,
-      name: file.name ?? 'upload.jpg',
-      type: file.type ?? 'image/jpeg',
-    } as unknown as Blob);
+    // Native streams `{ uri, name, type }`; web needs a real Blob. Metro picks
+    // upload-part.web.ts for the browser build.
+    await appendImagePart(form, 'image', file);
 
     for (const [key, value] of Object.entries(fields)) form.append(key, value);
 

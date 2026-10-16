@@ -6,10 +6,12 @@ import { Platform } from 'react-native';
  * `react-native-mmkv` is the fastest option on native (mmap-backed, synchronous,
  * no bridge), but it is a native module: it is unavailable on web and it breaks
  * any Jest run that has not mocked it. Everything therefore goes through this
- * module, which falls back to an in-memory store on those platforms.
+ * module, which uses `localStorage` on web and falls back to an in-memory store
+ * where neither exists (tests, browsers with storage disabled).
  *
- * Secrets never come through here — see `lib/secure-storage.ts`, which uses
- * Keychain/Keystore via expo-secure-store.
+ * On native, secrets never come through here — see `lib/secure-storage.ts`,
+ * which uses Keychain/Keystore via expo-secure-store. On web there is no such
+ * vault, so the session tokens land here (see that file for the trade-off).
  */
 
 export interface KeyValueStore {
@@ -63,13 +65,78 @@ function createNativeStore(): KeyValueStore | null {
   }
 }
 
+/**
+ * `localStorage`, namespaced so `clearAll()` cannot wipe another app on the
+ * same origin. The in-memory store this replaces signed a web user out on every
+ * page refresh — fine for a dev preview, not for a deployed site.
+ */
+class WebStorageStore implements KeyValueStore {
+  constructor(
+    private readonly storage: Storage,
+    private readonly prefix = 'platematch:',
+  ) {}
+
+  getString(key: string): string | undefined {
+    const value = this.storage.getItem(this.prefix + key);
+    return value === null ? undefined : value;
+  }
+
+  set(key: string, value: string): void {
+    this.storage.setItem(this.prefix + key, value);
+  }
+
+  delete(key: string): void {
+    this.storage.removeItem(this.prefix + key);
+  }
+
+  contains(key: string): boolean {
+    return this.storage.getItem(this.prefix + key) !== null;
+  }
+
+  getAllKeys(): string[] {
+    const keys: string[] = [];
+    for (let i = 0; i < this.storage.length; i += 1) {
+      const key = this.storage.key(i);
+      if (key?.startsWith(this.prefix)) keys.push(key.slice(this.prefix.length));
+    }
+    return keys;
+  }
+
+  clearAll(): void {
+    for (const key of this.getAllKeys()) this.storage.removeItem(this.prefix + key);
+  }
+}
+
+function createWebStore(): KeyValueStore | null {
+  if (Platform.OS !== 'web') return null;
+
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    // Safari private mode and storage-disabled browsers throw on write.
+    const probe = '__platematch_probe__';
+    window.localStorage.setItem(probe, '1');
+    window.localStorage.removeItem(probe);
+    return new WebStorageStore(window.localStorage);
+  } catch {
+    return null;
+  }
+}
+
 const nativeStore = createNativeStore();
+const persistentStore = nativeStore ?? createWebStore();
 const fallback = new MemoryStore();
 
-/** True when writes survive an app restart. False on web and in unit tests. */
-export const isPersistent = nativeStore !== null;
+/** Human-readable backend name, shown in Settings. */
+export const storageBackend: 'MMKV' | 'browser storage' | 'in memory' = nativeStore
+  ? 'MMKV'
+  : persistentStore
+    ? 'browser storage'
+    : 'in memory';
 
-const store: KeyValueStore = nativeStore ?? fallback;
+/** True when writes survive an app restart (MMKV on native, localStorage on web). */
+export const isPersistent = persistentStore !== null;
+
+const store: KeyValueStore = persistentStore ?? fallback;
 
 // ---------------------------------------------------------------------------
 // Typed helpers
