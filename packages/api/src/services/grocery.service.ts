@@ -25,7 +25,7 @@ import {
 } from '../db/schema.js';
 import { BadRequestError, NotFoundError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { CacheKeys, cache } from '../lib/redis.js';
+import { CacheKeys, cache, invalidateDashboardCaches } from '../lib/redis.js';
 import { estimatePriceUsd, formatQuantity, inferCategory, normalizeIngredient, round2 } from '../utils/food.js';
 import { toIsoDate, todayUtc } from '../utils/dates.js';
 import { computeSavings, lookupPricesBatch, type StorePrice as AiStorePrice } from './ai/grocery-price.service.js';
@@ -188,6 +188,9 @@ export async function generateGroceryList(userId: string, input: GenerateGrocery
     } satisfies PriceComparisonDto,
     CACHE_TTL_SECONDS.groceryPrices,
   );
+
+  // A new list carries a `savings_amount`, which the Stats screen sums.
+  await invalidateDashboardCaches(userId);
 
   logger.info({ userId, listId: list.id, items: items.length, total: totalCost, priced: withPrices }, 'Grocery list generated');
 
@@ -712,6 +715,8 @@ export async function refreshPrices(userId: string, listId: string): Promise<Pri
 
   await cache.set(CacheKeys.groceryPrices(listId), comparison, CACHE_TTL_SECONDS.groceryPrices);
   await cache.del(CacheKeys.groceryList(listId));
+  // `savings_amount` just changed, and the Stats screen sums it.
+  await invalidateDashboardCaches(userId);
 
   logger.info({ userId, listId, items: aggregated.length, saved: savings.saved, best: comparison.best_store }, 'Grocery prices refreshed');
 

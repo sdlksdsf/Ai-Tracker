@@ -25,7 +25,7 @@ import {
 import type { RecipeIngredient as RecipeIngredientRow } from '../db/schema.js';
 import { NotFoundError, QuotaExceededError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { CacheKeys, cache } from '../lib/redis.js';
+import { CacheKeys, cache, invalidateDashboardCaches } from '../lib/redis.js';
 import { stableHash } from '../lib/crypto.js';
 import { estimatePriceUsd, normalizeIngredient, round2, similarity } from '../utils/food.js';
 import { dayKey, daysUntilExpiry } from '../utils/dates.js';
@@ -769,6 +769,8 @@ export async function markRecipeCooked(
 
   await invalidatePantryCache(userId);
   await cache.del(CacheKeys.recipeDetail(recipeId));
+  // Cooking is a savings event: the Stats screen must not keep the old total.
+  await invalidateDashboardCaches(userId);
   void checkAndAward(userId).catch(() => undefined);
 
   const dto = annotateWithPantry(recipeToDto(full, { is_cooked: true }), await getActivePantryCached(userId));

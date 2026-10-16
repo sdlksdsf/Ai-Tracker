@@ -5,7 +5,7 @@ import { getDb } from '../db/index.js';
 import { fridgeScans, pantryItems, users, type FridgeScan, type PantryItem } from '../db/schema.js';
 import { NotFoundError, QuotaExceededError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { CacheKeys, cache } from '../lib/redis.js';
+import { CacheKeys, cache, invalidateDashboardCaches } from '../lib/redis.js';
 import { normalizeIngredient } from '../utils/food.js';
 import { defaultShelfLifeDays, inferCategory } from '../utils/food.js';
 import { parseExpiryLabel, todayUtc, toIsoDate, addDays, daysUntilExpiry } from '../utils/dates.js';
@@ -129,18 +129,25 @@ export async function createScan(input: CreateScanInput): Promise<CreateScanResu
 
   // ---- Enqueue AI processing --------------------------------------------
   const queue = getQueue<ScanJobData>(QUEUE_NAMES.scan);
-  await queue.add('process-scan', {
-    scanId: scanRow.id,
-    userId: input.userId,
-    storageKey: upload.key,
-    photoUrl: upload.url,
-    skipBoxes: input.skipBoxes ?? false,
-    hint: input.hint,
-    // The worker needs the bytes; pass them only for the in-process fallback.
-    // With Redis we re-download from storage instead (job payloads stay small).
-    inlineBase64: queue.isRedisBacked ? undefined : processed.buffer.toString('base64'),
-    mimeType: processed.mimeType,
-  });
+  await queue.add(
+    'process-scan',
+    {
+      scanId: scanRow.id,
+      userId: input.userId,
+      storageKey: upload.key,
+      photoUrl: upload.url,
+      skipBoxes: input.skipBoxes ?? false,
+      hint: input.hint,
+      // The worker needs the bytes; pass them only for the in-process fallback.
+      // With Redis we re-download from storage instead (job payloads stay small).
+      inlineBase64: queue.isRedisBacked ? undefined : processed.buffer.toString('base64'),
+      mimeType: processed.mimeType,
+    },
+    // Retry policy stated explicitly so both back-ends agree: a vision call is
+    // the flakiest dependency in the product, and three attempts with backoff
+    // is what recovers a transient provider timeout.
+    { attempts: 3, backoffMs: 2_000 },
+  );
 
   logger.info(
     { scanId: scanRow.id, userId: input.userId, ms: Date.now() - started, bytes: processed.bytes },
@@ -379,11 +386,11 @@ export async function confirmScan(userId: string, scanId: string, input: Confirm
       };
     });
 
-  let created = 0;
+  let createdRows: Array<{ id: string; name: string }> = [];
   if (toInsert.length) {
-    const rows = await db.insert(pantryItems).values(toInsert).returning({ id: pantryItems.id, name: pantryItems.ingredientName });
-    created = rows.length;
+    createdRows = await db.insert(pantryItems).values(toInsert).returning({ id: pantryItems.id, name: pantryItems.ingredientName });
   }
+  const created = createdRows.length;
 
   const [updated] = await db
     .update(fridgeScans)
@@ -398,6 +405,8 @@ export async function confirmScan(userId: string, scanId: string, input: Confirm
     .returning();
 
   await invalidatePantryCache(userId);
+  // Confirming a scan fills the shelf: Home's pantry card counts these items.
+  await invalidateDashboardCaches(userId);
 
   logger.info(
     { scanId, confirmed: input.confirmed.length, removed: input.removed.length, added: input.added.length },
@@ -407,7 +416,11 @@ export async function confirmScan(userId: string, scanId: string, input: Confirm
   return {
     scan: scanToDto(updated as FridgeScan),
     created,
-    pantry_items: [],
+    // The rows that were just written, so the caller can navigate to them (or
+    // count them) without a second request. This used to return a literal `[]`
+    // while the insert's `returning()` was discarded — the response advertised
+    // a list of saved items and always said "none".
+    pantry_items: createdRows.map((row) => ({ id: row.id, ingredient_name: row.name })),
   };
 }
 

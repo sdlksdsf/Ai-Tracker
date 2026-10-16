@@ -48,7 +48,14 @@ interface InProcessJobRecord<T> {
   name: string;
   data: T;
   timer?: NodeJS.Timeout;
+  /** Delivery attempts for this job, mirroring BullMQ's per-job `attempts`. */
+  attempts?: number;
+  /** Fixed delay between attempts, in milliseconds. */
+  backoffMs?: number;
 }
+
+/** Matches `RedisQueue`'s `defaultJobOptions.attempts` so both back-ends retry alike. */
+const DEFAULT_ATTEMPTS = 3;
 
 class InProcessQueue<T> implements QueueLike<T> {
   readonly isRedisBacked = false;
@@ -69,7 +76,7 @@ class InProcessQueue<T> implements QueueLike<T> {
   async add(jobName: string, data: T, opts: AddJobOptions = {}): Promise<QueueJob<T>> {
     this.counter += 1;
     const id = opts.jobId ?? `${this.name}:${Date.now()}:${this.counter}`;
-    const record: InProcessJobRecord<T> = { id, name: jobName, data };
+    const record: InProcessJobRecord<T> = { id, name: jobName, data, attempts: opts.attempts, backoffMs: opts.backoffMs };
     this.jobs.set(id, record);
 
     const run = () => {
@@ -89,6 +96,9 @@ class InProcessQueue<T> implements QueueLike<T> {
 
   private async execute(record: InProcessJobRecord<T>): Promise<void> {
     if (!this.processor) {
+      // Drop the record: leaving it behind made `getJob()` report a job that
+      // nothing would ever run, and the map grew for the life of the process.
+      this.jobs.delete(record.id);
       logger.warn({ queue: this.name, job: record.id }, 'In-process queue has no registered processor');
       return;
     }
@@ -99,7 +109,12 @@ class InProcessQueue<T> implements QueueLike<T> {
     }
     this.running += 1;
     const started = Date.now();
-    const attempts = 2;
+    // Honour the caller's retry policy. This was hard-coded to two attempts,
+    // so `attempts`/`backoffMs` on `add()` were silently ignored whenever the
+    // queue ran in-process (dev, CI, a Redis-less deployment) and a scan that
+    // failed once was retried once instead of twice.
+    const attempts = Math.max(1, record.attempts ?? DEFAULT_ATTEMPTS);
+    const backoffMs = Math.max(0, record.backoffMs ?? 0);
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -120,7 +135,7 @@ class InProcessQueue<T> implements QueueLike<T> {
           { queue: this.name, job: record.id, attempt, err: (err as Error).message },
           'In-process job failed',
         );
-        if (attempt < attempts) await sleep(500 * attempt);
+        if (attempt < attempts) await sleep(backoffMs > 0 ? backoffMs : 500 * attempt);
       }
     }
 

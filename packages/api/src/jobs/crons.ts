@@ -1,7 +1,7 @@
 import { QUEUE_NAMES, getQueue, isRedisBacked } from '../lib/queue.js';
 import { logger } from '../lib/logger.js';
 import { env } from '../config/env.js';
-import type { MaintenancePayload } from './workers.js';
+import { runMaintenanceTask, SCAN_RETENTION_DAYS, type MaintenancePayload, type MaintenanceTask } from './workers.js';
 
 /**
  * Scheduled jobs (Section 7 — Notifications, Section 2 — BullMQ).
@@ -33,7 +33,13 @@ export interface CronDefinition {
   pattern: string;
   /** Milliseconds between runs in the in-process fallback. */
   intervalMs: number;
-  run: () => Promise<void>;
+  /**
+   * The task this schedule runs. It is the *only* thing that decides what the
+   * job does — both back-ends dispatch through `runMaintenanceTask`, so a
+   * schedule can no longer enqueue a job the worker does not recognise (or the
+   * wrong one).
+   */
+  task: MaintenanceTask;
 }
 
 /** Hourly marker jobs — each resolves the user's local time internally. */
@@ -46,82 +52,56 @@ export const CRONS: CronDefinition[] = [
     description: 'Expiry alerts — 3 days out and on the day, delivered at the user\'s 9 AM',
     pattern: '0 * * * *',
     intervalMs: HOURLY,
-    run: async () => {
-      const { sendExpiryAlertsSweep } = await import('./expiry-notifications.js');
-      const result = await sendExpiryAlertsSweep();
-      logger.info(result, 'Expiry alert sweep finished');
-    },
+    task: 'expiry-alerts',
   },
   {
     key: 'meal-reminders',
     description: 'Breakfast/lunch/dinner reminders at each user\'s configured times',
     pattern: '0 * * * *',
     intervalMs: HOURLY,
-    run: async () => {
-      const { sendMealRemindersSweep } = await import('./meal-reminders.js');
-      const result = await sendMealRemindersSweep();
-      logger.info(result, 'Meal reminder sweep finished');
-    },
+    task: 'meal-reminders',
   },
   {
     key: 'smart-suggestions',
     description: '"Cook this before it expires" suggestions at the user\'s 5 PM',
     pattern: '0 * * * *',
     intervalMs: HOURLY,
-    run: async () => {
-      const { sendSmartSuggestionsSweep } = await import('./smart-suggestions.js');
-      const result = await sendSmartSuggestionsSweep();
-      logger.info(result, 'Smart suggestion sweep finished');
-    },
+    task: 'smart-suggestions',
   },
   {
     key: 'weekly-report',
     description: 'Sunday 6 PM digest: waste, savings, streak and next week\'s plan',
     pattern: '0 * * * *',
     intervalMs: HOURLY,
-    run: async () => {
-      const { sendWeeklyReportsSweep } = await import('./weekly-report.js');
-      const result = await sendWeeklyReportsSweep();
-      logger.info(result, 'Weekly report sweep finished');
-    },
+    task: 'weekly-report',
   },
   {
     key: 'refresh-expiry-flags',
     description: 'Recompute pantry `is_expired` flags at 04:00 UTC',
     pattern: '0 4 * * *',
     intervalMs: DAILY,
-    run: async () => {
-      await getQueue<MaintenancePayload>(QUEUE_NAMES.maintenance).add('refresh-expiry', { task: 'refresh-expiry' });
-    },
+    task: 'refresh-expiry',
   },
   {
     key: 'purge-tokens',
     description: 'Delete expired refresh tokens and password-reset tokens at 03:30 UTC',
     pattern: '30 3 * * *',
     intervalMs: DAILY,
-    run: async () => {
-      await getQueue<MaintenancePayload>(QUEUE_NAMES.maintenance).add('purge-tokens', { task: 'purge-tokens' });
-    },
+    task: 'purge-tokens',
   },
   {
     key: 'purge-scans',
-    description: 'Drop scans older than 30 days at 03:45 UTC (photos stay in storage)',
+    description: `Drop scans older than ${SCAN_RETENTION_DAYS} days at 03:45 UTC (photos stay in storage)`,
     pattern: '45 3 * * *',
     intervalMs: DAILY,
-    run: async () => {
-      await getQueue<MaintenancePayload>(QUEUE_NAMES.maintenance).add('purge-scans', { task: 'purge-scans' });
-    },
+    task: 'purge-scans',
   },
   {
     key: 'recalculate-achievements',
     description: 'Re-evaluate badges for recently active users at 05:00 UTC',
     pattern: '0 5 * * *',
     intervalMs: DAILY,
-    run: async () => {
-      await getQueue<MaintenancePayload>(QUEUE_NAMES.maintenance).add('recalculate-achievements', {
-        task: 'recalculate-achievements',
-      });
-    },
+    task: 'recalculate-achievements',
   },
 ];
 
@@ -146,11 +126,17 @@ export async function startCrons(): Promise<void> {
     for (const cron of CRONS) {
       try {
         // eslint-disable-next-line no-await-in-loop
-        await queue.add(cron.key, { task: 'refresh-expiry' } as MaintenancePayload, {
-          pattern: cron.pattern,
-          jobId: `cron:${cron.key}`,
-          removeOnComplete: true,
-        });
+        await queue.add(
+          cron.key,
+          // Each schedule carries its own task. Hard-coding a payload here is
+          // what made the scheduler and the worker disagree.
+          { task: cron.task },
+          {
+            pattern: cron.pattern,
+            jobId: `cron:${cron.key}`,
+            removeOnComplete: true,
+          },
+        );
       } catch (err) {
         logger.warn({ err: (err as Error).message, cron: cron.key }, 'Could not schedule repeatable job');
       }
@@ -160,20 +146,19 @@ export async function startCrons(): Promise<void> {
     return;
   }
 
-  // In-process fallback: one timer per cron, staggered so they do not all fire
-  // on the same tick after a restart.
-  timers = CRONS.map((cron, index) => {
+  // In-process fallback: one timer per cron. They share a phase, so every job
+  // fires one full interval after boot rather than immediately on startup.
+  timers = CRONS.map((cron) => {
     const timer = setInterval(() => {
-      cron.run().catch((err: unknown) => {
-        logger.error({ err, cron: cron.key }, 'Scheduled job failed');
+      runMaintenanceTask(cron.task).catch((err: unknown) => {
+        logger.error({ err, cron: cron.key, task: cron.task }, 'Scheduled job failed');
       });
     }, cron.intervalMs);
     timer.unref();
-    // First run after one interval plus a small per-job offset.
     return timer;
   });
 
-  logger.info({ crons: CRONS.length, backend: 'in-process', note: `first run in ~1h (index offset ${timers.length})` }, 'Scheduled jobs registered');
+  logger.info({ crons: CRONS.length, backend: 'in-process', firstRun: `~${Math.round(CRONS[0]!.intervalMs / 60_000)} min` }, 'Scheduled jobs registered');
 }
 
 /** Stop every timer. Called on shutdown. */

@@ -16,15 +16,19 @@ import {
   fromIsoDate,
   greetingForHour,
   hourInTimezone,
+  isoDatesInRange,
   isoDayOfWeek,
   isoWeekKey,
+  localPeriodDates,
   minuteOfHourInTimezone,
   monthKey,
   parseExpiryLabel,
   periodStart,
   previousPeriodRange,
+  startOfDayInTimezone,
   startOfWeek,
   endOfWeek,
+  timezoneOffsetMinutes,
   suggestExpiry,
   todayInTimezone,
   todayUtc,
@@ -455,5 +459,141 @@ describe('previousPeriodRange', () => {
 
     const year = previousPeriodRange('year', REF);
     expect(daysBetween(year.start, year.end)).toBe(364);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-user local calendars
+// ---------------------------------------------------------------------------
+
+describe('timezoneOffsetMinutes', () => {
+  it('is zero on UTC', () => {
+    expect(timezoneOffsetMinutes('UTC', REF)).toBe(0);
+  });
+
+  it('measures minutes east of UTC', () => {
+    expect(timezoneOffsetMinutes('Asia/Karachi', REF)).toBe(300);
+    expect(timezoneOffsetMinutes('Asia/Kolkata', REF)).toBe(330);
+    expect(timezoneOffsetMinutes('America/New_York', REF)).toBe(-240);
+  });
+
+  it('follows daylight saving', () => {
+    const winter = fromIsoDate('2026-01-15');
+    const summer = fromIsoDate('2026-07-15');
+    expect(timezoneOffsetMinutes('America/New_York', winter)).toBe(-300);
+    expect(timezoneOffsetMinutes('America/New_York', summer)).toBe(-240);
+    expect(timezoneOffsetMinutes('Europe/London', summer)).toBe(60);
+  });
+
+  it('falls back to UTC for an unknown zone', () => {
+    expect(timezoneOffsetMinutes('Mars/Olympus_Mons', REF)).toBe(0);
+  });
+});
+
+describe('startOfDayInTimezone', () => {
+  it('converts a local midnight into the matching UTC instant', () => {
+    expect(startOfDayInTimezone('Asia/Karachi', '2026-10-19').toISOString()).toBe('2026-10-18T19:00:00.000Z');
+    expect(startOfDayInTimezone('UTC', '2026-10-19').toISOString()).toBe('2026-10-19T00:00:00.000Z');
+    expect(startOfDayInTimezone('America/New_York', '2026-10-19').toISOString()).toBe('2026-10-19T04:00:00.000Z');
+  });
+
+  it('resolves the DST boundary in both directions', () => {
+    // US DST starts 2026-03-08: the day begins in EST, the next one in EDT.
+    expect(startOfDayInTimezone('America/New_York', '2026-03-08').toISOString()).toBe('2026-03-08T05:00:00.000Z');
+    expect(startOfDayInTimezone('America/New_York', '2026-03-09').toISOString()).toBe('2026-03-09T04:00:00.000Z');
+    // And ends 2026-11-01: EDT on the day itself, EST afterwards.
+    expect(startOfDayInTimezone('America/New_York', '2026-11-01').toISOString()).toBe('2026-11-01T04:00:00.000Z');
+    expect(startOfDayInTimezone('America/New_York', '2026-11-02').toISOString()).toBe('2026-11-02T05:00:00.000Z');
+  });
+
+  it('treats an unknown zone as UTC', () => {
+    expect(startOfDayInTimezone('Nope/Nope', '2026-10-19').toISOString()).toBe('2026-10-19T00:00:00.000Z');
+  });
+});
+
+describe('localPeriodDates', () => {
+  it('anchors a week on the local Monday', () => {
+    const monday = localPeriodDates('week', '2026-10-19');
+    expect(monday.startIso).toBe('2026-10-19');
+    expect(monday.endIso).toBe('2026-10-19');
+    expect(monday.previousStartIso).toBe('2026-10-12');
+    expect(monday.previousEndIso).toBe('2026-10-18');
+  });
+
+  it('puts a local Sunday in the week that started six days earlier', () => {
+    const sunday = localPeriodDates('week', '2026-10-18');
+    expect(sunday.startIso).toBe('2026-10-12');
+    expect(sunday.previousEndIso).toBe('2026-10-11');
+  });
+
+  it('rolls the previous month across the year boundary', () => {
+    expect(localPeriodDates('month', '2026-01-05').startIso).toBe('2026-01-01');
+    expect(localPeriodDates('month', '2026-01-05').previousStartIso).toBe('2025-12-01');
+    expect(localPeriodDates('month', '2026-03-31').previousStartIso).toBe('2026-02-01');
+    expect(localPeriodDates('month', '2026-03-31').previousEndIso).toBe('2026-02-28');
+  });
+
+  it('anchors quarters on their first month', () => {
+    expect(localPeriodDates('quarter', '2026-05-05').startIso).toBe('2026-04-01');
+    expect(localPeriodDates('quarter', '2026-05-05').previousStartIso).toBe('2026-01-01');
+    expect(localPeriodDates('quarter', '2026-02-05').previousStartIso).toBe('2025-10-01');
+  });
+
+  it('covers the previous calendar year for year periods', () => {
+    const year = localPeriodDates('year', '2026-01-01');
+    expect(year.startIso).toBe('2026-01-01');
+    expect(year.previousStartIso).toBe('2025-01-01');
+    expect(year.previousEndIso).toBe('2025-12-31');
+  });
+
+  it('keeps the previous window directly before the current one', () => {
+    for (const period of ['week', 'month', 'quarter', 'year'] as const) {
+      const window = localPeriodDates(period, '2026-10-15');
+      expect(daysBetween(window.previousEndIso, window.startIso)).toBe(1);
+      expect(daysBetween(window.startIso, window.endIso)).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('starts the current window no later than the local day, east of UTC included', () => {
+    // 02:00 Monday in Karachi is 21:00 Sunday UTC. Anchoring the week to UTC
+    // midnight put the window start in the future, so "This week" was empty
+    // for the user who had *just* logged waste.
+    const instant = new Date('2026-10-18T21:00:00.000Z');
+    const localToday = todayInTimezone('Asia/Karachi', instant);
+    expect(localToday).toBe('2026-10-19');
+
+    const window = localPeriodDates('week', localToday);
+    const start = startOfDayInTimezone('Asia/Karachi', window.startIso);
+
+    expect(start.getTime()).toBeLessThanOrEqual(instant.getTime());
+    expect(start.toISOString()).toBe('2026-10-18T19:00:00.000Z');
+  });
+});
+
+describe('isoDatesInRange', () => {
+  it('is inclusive at both ends', () => {
+    expect(isoDatesInRange('2026-10-15', '2026-10-19')).toEqual([
+      '2026-10-15',
+      '2026-10-16',
+      '2026-10-17',
+      '2026-10-18',
+      '2026-10-19',
+    ]);
+  });
+
+  it('returns a single day when the ends match', () => {
+    expect(isoDatesInRange('2026-10-15', '2026-10-15')).toEqual(['2026-10-15']);
+  });
+
+  it('crosses a month boundary', () => {
+    expect(isoDatesInRange('2026-10-30', '2026-11-02')).toEqual(['2026-10-30', '2026-10-31', '2026-11-01', '2026-11-02']);
+  });
+
+  it('is capped so a stray range cannot build an unbounded series', () => {
+    expect(isoDatesInRange('2000-01-01', '2026-01-01')).toHaveLength(400);
+  });
+
+  it('returns nothing when the end precedes the start', () => {
+    expect(isoDatesInRange('2026-10-19', '2026-10-15')).toEqual([]);
   });
 });

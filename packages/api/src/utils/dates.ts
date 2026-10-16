@@ -305,3 +305,135 @@ export function previousPeriodRange(period: 'week' | 'month' | 'quarter' | 'year
       return { start, end };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Per-user local calendars
+// ---------------------------------------------------------------------------
+
+/**
+ * Offset of `timezone` from UTC, in minutes east, at `instant`.
+ *
+ * `Intl` renders a zoned wall clock; subtracting the instant back out gives the
+ * zone's offset for that exact moment, which is what makes DST transitions
+ * resolvable without a library.
+ */
+export function timezoneOffsetMinutes(timezone: string, instant = new Date()): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).formatToParts(instant);
+
+    const at = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? '0');
+    const wallClock = Date.UTC(at('year'), at('month') - 1, at('day'), at('hour') % 24, at('minute'), at('second'));
+
+    // Millisecond precision is dropped by the formatter, so compare against the
+    // whole-second instant.
+    const whole = instant.getTime() - instant.getMilliseconds();
+    return Math.round((wallClock - whole) / 60_000);
+  } catch {
+    // Unknown IANA zone (or an Intl without that zone): treat as UTC.
+    return 0;
+  }
+}
+
+/**
+ * The UTC instant at which `isoDate` begins (00:00) in `timezone`.
+ *
+ * Used to turn a user's local calendar day into the instant range a
+ * `timestamptz` column can be filtered by — "wasted today in Karachi" starts at
+ * 19:00 UTC the day before.
+ */
+export function startOfDayInTimezone(timezone: string, isoDate: string): Date {
+  const naive = fromIsoDate(isoDate);
+  const guess = new Date(naive.getTime() - timezoneOffsetMinutes(timezone, naive) * 60_000);
+  // Re-resolve with the offset in force at the resolved instant: on a DST
+  // boundary the first guess can land in a different offset.
+  return new Date(naive.getTime() - timezoneOffsetMinutes(timezone, guess) * 60_000);
+}
+
+export interface LocalPeriodDates {
+  /** First local day of the current period (inclusive). */
+  startIso: string;
+  /** Last local day of the current period (inclusive). */
+  endIso: string;
+  /** Last local day of the preceding period (inclusive). */
+  previousStartIso: string;
+  previousEndIso: string;
+}
+
+/**
+ * Calendar boundaries for a stats period, expressed as the *user's* local
+ * dates.
+ *
+ * `periodStart` above anchors everything to UTC midnight, which is wrong for
+ * the ~2/3 of the world that is not on UTC: a Karachi user logging waste at
+ * 02:00 on Monday was filing it under the previous UTC week, and at 02:00 on
+ * the first of the month the whole screen still showed last month.
+ */
+export function localPeriodDates(
+  period: 'week' | 'month' | 'quarter' | 'year' | 'all',
+  localToday: string,
+): LocalPeriodDates {
+  const year = Number(localToday.slice(0, 4));
+  const month = Number(localToday.slice(5, 7));
+
+  let startIso: string;
+  let previousStartIso: string;
+
+  switch (period) {
+    case 'week':
+      // Monday of the local week containing `localToday`.
+      startIso = toIsoDate(addDays(localToday, -(isoDayOfWeek(localToday) - 1)));
+      previousStartIso = toIsoDate(addDays(startIso, -7));
+      break;
+    case 'month':
+      startIso = `${localToday.slice(0, 7)}-01`;
+      previousStartIso = month === 1 ? `${year - 1}-12-01` : `${year}-${String(month - 1).padStart(2, '0')}-01`;
+      break;
+    case 'quarter': {
+      const quarterStartMonth = Math.floor((month - 1) / 3) * 3 + 1;
+      startIso = `${year}-${String(quarterStartMonth).padStart(2, '0')}-01`;
+      previousStartIso =
+        quarterStartMonth === 1
+          ? `${year - 1}-10-01`
+          : `${year}-${String(quarterStartMonth - 3).padStart(2, '0')}-01`;
+      break;
+    }
+    case 'year':
+      startIso = `${year}-01-01`;
+      previousStartIso = `${year - 1}-01-01`;
+      break;
+    case 'all':
+      startIso = '1970-01-01';
+      previousStartIso = '1970-01-01';
+      break;
+  }
+
+  return {
+    startIso,
+    endIso: localToday,
+    previousStartIso,
+    previousEndIso: toIsoDate(addDays(startIso, -1)),
+  };
+}
+
+/** Every local date from `startIso` to `endIso` inclusive (capped at 400 days). */
+export function isoDatesInRange(startIso: string, endIso: string): string[] {
+  const dates: string[] = [];
+  const last = fromIsoDate(endIso).getTime();
+  let cursor = fromIsoDate(startIso).getTime();
+
+  while (cursor <= last && dates.length < 400) {
+    dates.push(toIsoDate(cursor));
+    cursor += MS_PER_DAY;
+  }
+
+  return dates;
+}

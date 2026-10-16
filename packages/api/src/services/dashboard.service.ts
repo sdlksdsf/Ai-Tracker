@@ -22,9 +22,21 @@ import {
   type PantryItem,
 } from '../db/schema.js';
 import { logger } from '../lib/logger.js';
-import { CacheKeys, cache } from '../lib/redis.js';
+import { CacheKeys, cache, invalidateDashboardCaches } from '../lib/redis.js';
 import { estimatePriceUsd, normalizeIngredient, round2 } from '../utils/food.js';
-import { addDays, greetingForHour, hourInTimezone, periodStart, toIsoDate, todayInTimezone, todayUtc } from '../utils/dates.js';
+import {
+  addDays,
+  greetingForHour,
+  hourInTimezone,
+  isoDatesInRange,
+  localPeriodDates,
+  periodStart,
+  startOfDayInTimezone,
+  toIsoDate,
+  todayInTimezone,
+  todayUtc,
+} from '../utils/dates.js';
+import { NotFoundError } from '../lib/errors.js';
 import { getExpiringSoon, getPantryStats } from './pantry.service.js';
 import { getWasteStats, getWasteImpact, wasteFreeStreak } from './waste.service.js';
 import { getAchievementsProgress } from './achievement.service.js';
@@ -53,8 +65,10 @@ export async function getHomeSummary(userId: string): Promise<HomeSummaryDto> {
   const db = getDb();
   const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   if (!user) {
+    // A deleted account whose access token is still valid: a 401/404, not the
+    // 500 a bare Error produced.
     logger.warn({ userId }, 'Home summary requested for missing user');
-    throw new Error('User not found');
+    throw new NotFoundError('User not found');
   }
 
   const timezone = user.timezone ?? 'UTC';
@@ -109,6 +123,12 @@ export async function getHomeSummary(userId: string): Promise<HomeSummaryDto> {
   return summary;
 }
 
+/** The user's IANA timezone, defaulting to UTC when unset or blank. */
+async function dashboardTimezone(db: ReturnType<typeof getDb>, userId: string): Promise<string> {
+  const [row] = await db.select({ timezone: users.timezone }).from(users).where(eq(users.id, userId)).limit(1);
+  return row?.timezone?.trim() || 'UTC';
+}
+
 async function getTodaysMeals(userId: string, today: string): Promise<HomeSummaryDto['todays_meals']> {
   const db = getDb();
   const dayOfWeek = new Date(`${today}T12:00:00Z`).getUTCDay();
@@ -134,6 +154,13 @@ async function getTodaysMeals(userId: string, today: string): Promise<HomeSummar
       and(
         eq(mealPlans.userId, userId),
         eq(mealPlans.status, 'active'),
+        // The plan has to cover today. Matching on day-of-week alone pulled in
+        // entries from any other still-active plan for the same weekday, and
+        // generating a plan never archives the previous one — so a user who
+        // planned two weeks in a row saw two dinners (last week's and this
+        // week's) under "Today's meals".
+        sql`${mealPlans.weekStartDate} <= ${today}`,
+        sql`${mealPlans.weekEndDate} >= ${today}`,
         sql`(${mealPlanEntries.date} = ${today} OR ${mealPlanEntries.dayOfWeek} = ${normalizedDay})`,
       ),
     )
@@ -157,7 +184,11 @@ async function getTodaysMeals(userId: string, today: string): Promise<HomeSummar
 async function getQuickSuggestions(userId: string, limit: number): Promise<RecipeDto[]> {
   const db = getDb();
 
-  // Prefer recipes that use something about to expire.
+  // Prefer recipes that use something about to expire — judged against the
+  // user's own date, since `expiry_date` is a plain date and "today" differs
+  // from UTC for most of the world.
+  const localToday = todayInTimezone(await dashboardTimezone(db, userId));
+
   const expiringNames = await db
     .select({ name: pantryItems.ingredientName })
     .from(pantryItems)
@@ -167,7 +198,7 @@ async function getQuickSuggestions(userId: string, limit: number): Promise<Recip
         eq(pantryItems.isUsed, false),
         eq(pantryItems.isExpired, false),
         sql`${pantryItems.expiryDate} IS NOT NULL`,
-        sql`${pantryItems.expiryDate} BETWEEN ${toIsoDate(todayUtc())} AND ${toIsoDate(addDays(todayUtc(), 3))}`,
+        sql`${pantryItems.expiryDate} BETWEEN ${localToday} AND ${toIsoDate(addDays(localToday, 3))}`,
       ),
     )
     .limit(3);
@@ -273,30 +304,59 @@ export async function getSavingsStats(userId: string, period: StatsPeriod = 'mon
   return stats;
 }
 
-/** 8 weekly points of money saved + CO₂ for the Stats line chart. */
+/**
+ * Eight weekly points of money saved for the Stats line chart.
+ *
+ * Counts the two savings the user actually realizes that week — grocery-list
+ * savings and "60% of the cost of what I cooked instead of ordering in" — so
+ * the chart adds up to the same story as `total_saved_usd`. (Waste *reduction*
+ * is a period-over-period figure and has no per-week value.)
+ *
+ * Weeks are the user's local weeks, and the eight points come from two grouped
+ * queries rather than one query per week.
+ */
 async function savingsTrend(userId: string): Promise<TrendPoint[]> {
   const db = getDb();
-  const points: TrendPoint[] = [];
+  const timezone = await dashboardTimezone(db, userId);
+  const currentWeekStartIso = localPeriodDates('week', todayInTimezone(timezone)).startIso;
+  const firstWeekStartIso = toIsoDate(addDays(currentWeekStartIso, -7 * 7));
+  const since = startOfDayInTimezone(timezone, firstWeekStartIso);
 
-  for (let i = 7; i >= 0; i -= 1) {
-    const weekStart = new Date(periodStart('week').getTime() - i * 7 * 86_400_000);
-    const weekEnd = new Date(weekStart.getTime() + 7 * 86_400_000 - 1);
+  const groceryWeek =
+    sql<string>`to_char(date_trunc('week', ${groceryLists.createdAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`;
+  const cookWeek =
+    sql<string>`to_char(date_trunc('week', ${recipeCookLog.cookedAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`;
 
-    // eslint-disable-next-line no-await-in-loop
-    const [row] = await db
+  const [groceryRows, cookRows] = await Promise.all([
+    db
       .select({
-        cost: sql<number>`COALESCE(SUM(${groceryLists.savingsAmount}), 0)::numeric`,
+        week: groceryWeek.as('local_week'),
+        savings: sql<number>`COALESCE(SUM(${groceryLists.savingsAmount}), 0)::numeric`,
       })
       .from(groceryLists)
-      .where(and(eq(groceryLists.userId, userId), sql`${groceryLists.createdAt} BETWEEN ${weekStart} AND ${weekEnd}`));
+      .where(and(eq(groceryLists.userId, userId), sql`${groceryLists.createdAt} >= ${since}`))
+      .groupBy(sql`local_week`),
+    db
+      .select({
+        week: cookWeek.as('local_week'),
+        savings: sql<number>`COALESCE(SUM(${recipes.totalCostEstimate} * 0.6), 0)::numeric`,
+      })
+      .from(recipeCookLog)
+      .innerJoin(recipes, eq(recipes.id, recipeCookLog.recipeId))
+      .where(and(eq(recipeCookLog.userId, userId), sql`${recipeCookLog.cookedAt} >= ${since}`))
+      .groupBy(sql`local_week`),
+  ]);
 
-    points.push({
-      label: toIsoDate(weekStart),
-      value: round2(Number(row?.cost ?? 0)),
-    });
-  }
+  const groceryByWeek = new Map(groceryRows.map((r) => [String(r.week), Number(r.savings)]));
+  const cookByWeek = new Map(cookRows.map((r) => [String(r.week), Number(r.savings)]));
 
-  return points;
+  return Array.from({ length: 8 }, (_, index) => {
+    const weekIso = toIsoDate(addDays(firstWeekStartIso, index * 7));
+    return {
+      label: weekIso,
+      value: round2((groceryByWeek.get(weekIso) ?? 0) + (cookByWeek.get(weekIso) ?? 0)),
+    };
+  });
 }
 
 /** Combined dashboard payload for GET /dashboard. */
@@ -419,12 +479,7 @@ function headlineFor(saved: number, wasteChangePct: number, mealsCooked: number)
 
 /** Invalidate the cached dashboards for a user (called after pantry/plan writes). */
 export async function invalidateDashboard(userId: string): Promise<void> {
-  await Promise.all([
-    cache.del(CacheKeys.dashboard(userId, 'home')),
-    cache.del(CacheKeys.dashboard(userId, 'savings:week')),
-    cache.del(CacheKeys.dashboard(userId, 'savings:month')),
-    cache.del(CacheKeys.dashboard(userId, 'savings:year')),
-  ]);
+  await invalidateDashboardCaches(userId);
 }
 
 /** Trend series for the Stats screen charts. */
@@ -434,44 +489,80 @@ export async function getTrends(userId: string, days = 30): Promise<{
   meals: TrendPoint[];
 }> {
   const db = getDb();
-  const since = new Date(Date.now() - days * 86_400_000);
+  const span = Math.min(Math.max(1, days), 90);
+  const timezone = await dashboardTimezone(db, userId);
+  const localToday = todayInTimezone(timezone);
+  const firstDayIso = toIsoDate(addDays(localToday, -(span - 1)));
+  const since = startOfDayInTimezone(timezone, firstDayIso);
 
-  const [wasteRows, mealRows] = await Promise.all([
+  // Bucket on the user's local day: the chart is labelled with dates the user
+  // reads, so a bucket keyed to the server's calendar put late-evening activity
+  // under the wrong label.
+  const wasteDay = sql<string>`to_char(date(${foodWasteLogs.loggedAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`;
+  const mealDay = sql<string>`to_char(date(${recipeCookLog.cookedAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`;
+  const groceryDay = sql<string>`to_char(date(${groceryLists.createdAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`;
+
+  const [wasteRows, mealRows, cookRows, groceryRows] = await Promise.all([
     db
       .select({
-        date: sql<string>`to_char(date(${foodWasteLogs.loggedAt}), 'YYYY-MM-DD')`,
+        date: wasteDay.as('local_day'),
         cost: sql<number>`COALESCE(SUM(${foodWasteLogs.estimatedCostUsd}), 0)::numeric`,
       })
       .from(foodWasteLogs)
       .where(and(eq(foodWasteLogs.userId, userId), sql`${foodWasteLogs.loggedAt} >= ${since}`))
-      .groupBy(sql`date(${foodWasteLogs.loggedAt})`)
-      .orderBy(sql`date(${foodWasteLogs.loggedAt}) ASC`),
+      .groupBy(sql`local_day`)
+      .orderBy(sql`local_day ASC`),
     db
       .select({
-        date: sql<string>`to_char(date(${recipeCookLog.cookedAt}), 'YYYY-MM-DD')`,
+        date: mealDay.as('local_day'),
         count: sql<number>`count(*)::int`,
       })
       .from(recipeCookLog)
       .where(and(eq(recipeCookLog.userId, userId), sql`${recipeCookLog.cookedAt} >= ${since}`))
-      .groupBy(sql`date(${recipeCookLog.cookedAt})`)
-      .orderBy(sql`date(${recipeCookLog.cookedAt}) ASC`),
+      .groupBy(sql`local_day`)
+      .orderBy(sql`local_day ASC`),
+    // Cooking savings: the same "60% of the recipe's ingredient cost" rule the
+    // savings card uses, so the chart and the headline agree.
+    db
+      .select({
+        date: mealDay.as('local_day'),
+        savings: sql<number>`COALESCE(SUM(${recipes.totalCostEstimate} * 0.6), 0)::numeric`,
+      })
+      .from(recipeCookLog)
+      .innerJoin(recipes, eq(recipes.id, recipeCookLog.recipeId))
+      .where(and(eq(recipeCookLog.userId, userId), sql`${recipeCookLog.cookedAt} >= ${since}`))
+      .groupBy(sql`local_day`)
+      .orderBy(sql`local_day ASC`),
+    db
+      .select({
+        date: groceryDay.as('local_day'),
+        savings: sql<number>`COALESCE(SUM(${groceryLists.savingsAmount}), 0)::numeric`,
+      })
+      .from(groceryLists)
+      .where(and(eq(groceryLists.userId, userId), sql`${groceryLists.createdAt} >= ${since}`))
+      .groupBy(sql`local_day`)
+      .orderBy(sql`local_day ASC`),
   ]);
 
   const wasteMap = new Map(wasteRows.map((r) => [String(r.date), round2(Number(r.cost))]));
   const mealMap = new Map(mealRows.map((r) => [String(r.date), Number(r.count)]));
+  const groceryMap = new Map(groceryRows.map((r) => [String(r.date), Number(r.savings)]));
+  const cookMap = new Map(cookRows.map((r) => [String(r.date), Number(r.savings)]));
 
   const waste: TrendPoint[] = [];
   const meals: TrendPoint[] = [];
   const savings: TrendPoint[] = [];
 
-  let cumulative = 0;
-  for (let i = days - 1; i >= 0; i -= 1) {
-    const date = toIsoDate(new Date(Date.now() - i * 86_400_000));
-    const wasted = wasteMap.get(date) ?? 0;
-    cumulative += Math.max(0, 2 - wasted * 0.5);
-    waste.push({ label: date, value: wasted });
+  for (const date of isoDatesInRange(firstDayIso, localToday)) {
+    // A day's savings is the money that day's cooking and shopping actually
+    // saved. This used to be a made-up cumulative curve
+    // (`+= max(0, 2 - wasted * 0.5)`) that had no relationship to the user's
+    // grocery or cooking savings.
+    const savedToday = round2((cookMap.get(date) ?? 0) + (groceryMap.get(date) ?? 0));
+
+    waste.push({ label: date, value: wasteMap.get(date) ?? 0 });
     meals.push({ label: date, value: mealMap.get(date) ?? 0 });
-    savings.push({ label: date, value: round2(cumulative) });
+    savings.push({ label: date, value: savedToday });
   }
 
   return { waste, savings, meals };

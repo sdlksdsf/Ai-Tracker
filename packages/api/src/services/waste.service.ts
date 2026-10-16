@@ -10,9 +10,17 @@ import { getDb } from '../db/index.js';
 import { foodWasteLogs, pantryItems, users, type FoodWasteLog } from '../db/schema.js';
 import { BadRequestError, NotFoundError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { CacheKeys, cache } from '../lib/redis.js';
+import { CacheKeys, cache, invalidateDashboardCaches } from '../lib/redis.js';
 import { co2ForWaste, estimatePriceUsd, inferCategory, normalizeIngredient, round2, toGrams } from '../utils/food.js';
-import { daysBetween, periodStart, previousPeriodRange, toIsoDate, todayUtc } from '../utils/dates.js';
+import {
+  addDays,
+  daysBetween,
+  isoDatesInRange,
+  localPeriodDates,
+  startOfDayInTimezone,
+  toIsoDate,
+  todayInTimezone,
+} from '../utils/dates.js';
 import { wasteToDto } from './dto.js';
 import { checkAndAward } from './achievement.service.js';
 import { invalidatePantryCache } from './pantry.service.js';
@@ -75,6 +83,8 @@ export async function createWasteLog(userId: string, input: CreateWasteLogInput)
   }
 
   await cache.del(CacheKeys.wasteStats(userId));
+  // The Home/Stats cards read these numbers straight back.
+  await invalidateDashboardCaches(userId);
   void checkAndAward(userId).catch(() => undefined);
 
   logger.info({ userId, id: created.id, co2, cost, reason: input.reason }, 'Waste logged');
@@ -149,6 +159,7 @@ export async function deleteWasteLog(userId: string, logId: string): Promise<voi
     .returning({ id: foodWasteLogs.id });
   if (!rows.length) throw new NotFoundError('Waste log not found');
   await cache.del(CacheKeys.wasteStats(userId));
+  await invalidateDashboardCaches(userId);
 }
 
 // ---------------------------------------------------------------------------
@@ -163,26 +174,34 @@ export async function getWasteStats(userId: string, period: WastePeriod = 'week'
   if (cached) return cached;
 
   const db = getDb();
-  const window = period === 'year' ? 'year' : period === 'month' ? 'month' : 'week';
-  const start = periodStart(window);
+  const timezone = await userTimezone(db, userId);
+  // Periods are the *user's* calendar periods. Anchoring them to UTC midnight
+  // moved a Karachi user's Monday-morning waste into last week, and on the 1st
+  // of the month the whole screen still showed the previous month.
+  const window = localPeriodDates(period, todayInTimezone(timezone));
+
+  const start = startOfDayInTimezone(timezone, window.startIso);
   const end = new Date();
-  const previous = previousPeriodRange(window);
+  const previous = {
+    start: startOfDayInTimezone(timezone, window.previousStartIso),
+    end: endOfLocalDay(timezone, window.previousEndIso),
+  };
 
   const [current, prev, byCategory, byReason, daily, streak] = await Promise.all([
     aggregate(db, userId, start, end),
     aggregate(db, userId, previous.start, previous.end),
     aggregateBy(db, userId, start, end, foodWasteLogs.category),
     aggregateBy(db, userId, start, end, foodWasteLogs.reason),
-    dailySeries(db, userId, start, end),
+    dailySeries(db, userId, window.startIso, window.endIso, timezone),
     wasteFreeStreak(userId),
   ]);
 
-  const periodDays = Math.max(1, daysBetween(toIsoDate(start), toIsoDate(end)) + 1);
+  const periodDays = Math.max(1, daysBetween(window.startIso, window.endIso) + 1);
 
   const stats: WasteStatsDto = {
     period,
-    period_start: toIsoDate(start),
-    period_end: toIsoDate(end),
+    period_start: window.startIso,
+    period_end: window.endIso,
     total_logs: current.count,
     total_grams: current.grams,
     total_cost_usd: round2(current.cost),
@@ -208,6 +227,18 @@ export async function getWasteStats(userId: string, period: WastePeriod = 'week'
 }
 
 type Db = ReturnType<typeof getDb>;
+
+/** The user's IANA timezone, falling back to UTC for unset/unknown values. */
+async function userTimezone(db: Db, userId: string): Promise<string> {
+  const [row] = await db.select({ timezone: users.timezone }).from(users).where(eq(users.id, userId)).limit(1);
+  const timezone = row?.timezone?.trim();
+  return timezone ? timezone : 'UTC';
+}
+
+/** The last millisecond of a local day — the inclusive end of a day range. */
+function endOfLocalDay(timezone: string, isoDate: string): Date {
+  return new Date(startOfDayInTimezone(timezone, isoDate).getTime() + 86_400_000 - 1);
+}
 
 interface Aggregate {
   count: number;
@@ -273,61 +304,72 @@ async function aggregateBy(
 async function dailySeries(
   db: Db,
   userId: string,
-  start: Date,
-  end: Date,
+  startIso: string,
+  endIso: string,
+  timezone: string,
 ): Promise<Array<{ date: string; cost_usd: number; co2_kg: number; count: number }>> {
+  // Bucket on the user's local day, not the server's: `date(logged_at)` uses
+  // the database session timezone, which put every evening's waste on the
+  // following day for anyone east of Greenwich.
+  const localDay = sql<string>`to_char(date(${foodWasteLogs.loggedAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`;
+
   const rows = await db
     .select({
-      date: sql<string>`to_char(date(${foodWasteLogs.loggedAt}), 'YYYY-MM-DD')`,
+      date: localDay.as('local_day'),
       count: sql<number>`count(*)::int`,
       cost: sql<number>`COALESCE(SUM(${foodWasteLogs.estimatedCostUsd}), 0)::numeric`,
       co2: sql<number>`COALESCE(SUM(${foodWasteLogs.co2EquivalentKg}), 0)::numeric`,
     })
     .from(foodWasteLogs)
-    .where(and(eq(foodWasteLogs.userId, userId), gte(foodWasteLogs.loggedAt, start), lte(foodWasteLogs.loggedAt, end)))
-    .groupBy(sql`date(${foodWasteLogs.loggedAt})`)
-    .orderBy(sql`date(${foodWasteLogs.loggedAt}) ASC`);
+    .where(
+      and(
+        eq(foodWasteLogs.userId, userId),
+        gte(foodWasteLogs.loggedAt, startOfDayInTimezone(timezone, startIso)),
+        lte(foodWasteLogs.loggedAt, endOfLocalDay(timezone, endIso)),
+      ),
+    )
+    .groupBy(sql`local_day`)
+    .orderBy(sql`local_day ASC`);
 
   // Fill gaps so the chart has a point per day.
   const byDate = new Map(rows.map((r) => [String(r.date), r]));
-  const series: Array<{ date: string; cost_usd: number; co2_kg: number; count: number }> = [];
 
-  for (let cursor = new Date(start); cursor <= end; cursor = new Date(cursor.getTime() + 86_400_000)) {
-    const key = toIsoDate(cursor);
+  return isoDatesInRange(startIso, endIso).map((key) => {
     const row = byDate.get(key);
-    series.push({
+    return {
       date: key,
       count: Number(row?.count ?? 0),
       cost_usd: round2(Number(row?.cost ?? 0)),
       co2_kg: round2(Number(row?.co2 ?? 0)),
-    });
-  }
-
-  return series;
+    };
+  });
 }
 
-/** Consecutive days (including today) with no waste log. */
+/** Consecutive local days (including today) with no waste log. */
 export async function wasteFreeStreak(userId: string): Promise<number> {
   const db = getDb();
+  const timezone = await userTimezone(db, userId);
+  const localToday = todayInTimezone(timezone);
+
   const rows = await db
-    .select({ day: sql<string>`to_char(date(${foodWasteLogs.loggedAt}), 'YYYY-MM-DD')` })
+    .select({ day: sql<string>`to_char(date(${foodWasteLogs.loggedAt} AT TIME ZONE ${timezone}), 'YYYY-MM-DD')`.as('local_day') })
     .from(foodWasteLogs)
     .where(eq(foodWasteLogs.userId, userId))
-    .orderBy(desc(sql`date(${foodWasteLogs.loggedAt})`))
+    .orderBy(desc(sql`local_day`))
     .limit(400);
 
   const wastedDays = new Set(rows.map((r) => String(r.day)));
-  let streak = 0;
-  const cursor = new Date();
 
-  // If the user logged waste today the streak is zero.
-  if (wastedDays.has(toIsoDate(cursor))) return 0;
+  // If the user logged waste today (their today) the streak is zero.
+  if (wastedDays.has(localToday)) return 0;
+
+  let streak = 0;
+  let cursor = localToday;
 
   for (let i = 0; i < 400; i += 1) {
-    const key = toIsoDate(cursor);
-    if (wastedDays.has(key)) break;
+    if (wastedDays.has(cursor)) break;
     streak += 1;
-    cursor.setTime(cursor.getTime() - 86_400_000);
+    cursor = toIsoDate(addDays(cursor, -1));
   }
 
   return streak;
@@ -341,20 +383,38 @@ function pctChange(current: number, previous: number): number {
 /** Impact calculator for the Waste Dashboard hero cards. */
 export async function getWasteImpact(userId: string): Promise<WasteImpactDto> {
   const db = getDb();
-  const [lifetime] = await db
-    .select({
-      co2: sql<number>`COALESCE(SUM(${foodWasteLogs.co2EquivalentKg}), 0)::numeric`,
-      cost: sql<number>`COALESCE(SUM(${foodWasteLogs.estimatedCostUsd}), 0)::numeric`,
-      grams: sql<number>`COALESCE(SUM(${foodWasteLogs.grams}), 0)::int`,
-    })
-    .from(foodWasteLogs)
-    .where(eq(foodWasteLogs.userId, userId));
+  const timezone = await userTimezone(db, userId);
+  const localToday = todayInTimezone(timezone);
 
-  const [memberRow] = await db.select({ createdAt: users.createdAt }).from(users).where(eq(users.id, userId)).limit(1);
-  const weeks = Math.max(1, Math.round(daysBetween(toIsoDate(memberRow?.createdAt ?? new Date()), toIsoDate(todayUtc())) / 7));
+  // "Your weekly waste" is a *recent* rate, over at most four weeks — the
+  // account's whole lifetime, divided by its age, decayed towards zero as the
+  // account got older and told a heavy waster they beat the average.
+  const [memberRow] = await db
+    .select({ createdAt: users.createdAt })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  const daysActive = Math.max(1, daysBetween(toIsoDate(memberRow?.createdAt ?? new Date()), localToday) + 1);
+  const weeks = Math.min(4, Math.max(1, Math.ceil(daysActive / 7)));
+  const recentStart = startOfDayInTimezone(timezone, toIsoDate(addDays(localToday, -7 * weeks)));
+
+  const [[lifetime], [recent]] = await Promise.all([
+    db
+      .select({
+        co2: sql<number>`COALESCE(SUM(${foodWasteLogs.co2EquivalentKg}), 0)::numeric`,
+        cost: sql<number>`COALESCE(SUM(${foodWasteLogs.estimatedCostUsd}), 0)::numeric`,
+        grams: sql<number>`COALESCE(SUM(${foodWasteLogs.grams}), 0)::int`,
+      })
+      .from(foodWasteLogs)
+      .where(eq(foodWasteLogs.userId, userId)),
+    db
+      .select({ grams: sql<number>`COALESCE(SUM(${foodWasteLogs.grams}), 0)::int` })
+      .from(foodWasteLogs)
+      .where(and(eq(foodWasteLogs.userId, userId), gte(foodWasteLogs.loggedAt, recentStart))),
+  ]);
 
   const co2 = Number(lifetime?.co2 ?? 0);
-  const userKgPerWeek = round2(Number(lifetime?.grams ?? 0) / 1000 / weeks);
+  const userKgPerWeek = round2(Number(recent?.grams ?? 0) / 1000 / weeks);
   // UNEP Food Waste Index: ~1.5 kg of household food waste per person per week.
   const nationalAverage = 1.5;
 

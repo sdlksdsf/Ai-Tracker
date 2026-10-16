@@ -227,6 +227,27 @@ export async function closeCache(): Promise<void> {
   redisClient = null;
 }
 
+/**
+ * Drop every cached dashboard payload for a user.
+ *
+ * Lives in the cache layer rather than in `dashboard.service` because the write
+ * paths that must call it (pantry, scans, waste, cooking, plans, grocery) are
+ * services that `dashboard.service` itself imports — importing it back would
+ * create a module cycle.
+ *
+ * Without this the Home and Stats screens keep serving pre-write numbers for
+ * the length of the cache TTL (60s / 300s): log a waste entry, switch to Home,
+ * and "saved this week" is stale.
+ */
+export async function invalidateDashboardCaches(userId: string): Promise<void> {
+  await Promise.all([
+    cache.del(CacheKeys.dashboard(userId, 'home')),
+    cache.del(CacheKeys.dashboard(userId, 'savings:week')),
+    cache.del(CacheKeys.dashboard(userId, 'savings:month')),
+    cache.del(CacheKeys.dashboard(userId, 'savings:year')),
+  ]);
+}
+
 export const cache = {
   get: <T>(key: string) => getCache().get<T>(key),
   set: <T>(key: string, value: T, ttl?: number) => getCache().set(key, value, ttl),

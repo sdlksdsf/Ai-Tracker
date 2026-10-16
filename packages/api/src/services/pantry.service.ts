@@ -5,9 +5,9 @@ import { pantryItems, type PantryItem } from '../db/schema.js';
 import { BadRequestError, NotFoundError, QuotaExceededError } from '../lib/errors.js';
 import { CacheKeys, cache } from '../lib/redis.js';
 import { sanitizeText } from '../lib/crypto.js';
-import { defaultShelfLifeDays, inferCategory, normalizeIngredient } from '../utils/food.js';
+import { defaultShelfLifeDays, estimatePriceUsd, inferCategory, normalizeIngredient, round2 } from '../utils/food.js';
 import { daysUntilExpiry, expiryLabel, expiryUrgency, todayUtc, toIsoDate } from '../utils/dates.js';
-import { pantryItemToDto, type PantryItemDto } from './dto.js';
+import { num, pantryItemToDto, type PantryItemDto } from './dto.js';
 import { getPlanLimits } from './subscription.service.js';
 import type { PantryStatsDto } from '@platematch/shared';
 import type { PromptPantryItem } from '../config/prompts.js';
@@ -289,6 +289,27 @@ export async function getPantryStats(userId: string): Promise<PantryStats> {
 
   const row = totals[0];
 
+  // What the shelf is worth, and which item has been sitting there longest.
+  // Both were hard-coded (`0` and `null`) while the Pantry screen renders
+  // "Estimated value" straight from this field, so every user saw $0.00.
+  const valueRows = await db
+    .select({
+      id: pantryItems.id,
+      name: pantryItems.ingredientName,
+      quantity: pantryItems.quantity,
+      unit: pantryItems.unit,
+      createdAt: pantryItems.createdAt,
+    })
+    .from(pantryItems)
+    .where(activeWhere)
+    .orderBy(asc(pantryItems.createdAt));
+
+  const totalEstimatedValue = round2(
+    valueRows.reduce((sum, item) => sum + estimatePriceUsd(item.name, num(item.quantity) ?? 1, item.unit ?? 'pcs'), 0),
+  );
+
+  const oldest = valueRows[0];
+
   return {
     total_items: Number(row?.total ?? 0),
     by_category: byCategory.map((c) => ({ category: c.category, count: Number(c.count) })),
@@ -296,10 +317,16 @@ export async function getPantryStats(userId: string): Promise<PantryStats> {
     expiring_soon: Number(row?.expiringSoon ?? 0),
     expired: Number(row?.expired ?? 0),
     fresh: Math.max(0, Number(row?.total ?? 0) - Number(row?.expiringSoon ?? 0) - Number(row?.expired ?? 0)),
-    total_estimated_value: 0,
+    total_estimated_value: totalEstimatedValue,
     items_added_this_week: Number(addedThisWeek[0]?.count ?? 0),
     items_used_this_week: Number(usedThisWeek[0]?.count ?? 0),
-    oldest_item: null,
+    oldest_item: oldest
+      ? {
+          id: oldest.id,
+          ingredient_name: oldest.name,
+          days: Math.max(0, Math.floor((Date.now() - new Date(oldest.createdAt).getTime()) / 86_400_000)),
+        }
+      : null,
   };
 }
 
